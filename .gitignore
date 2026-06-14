@@ -1,5 +1,10 @@
 .venv/
 .idea/
 data/
+*.sqlite
+*.csv
+*.parquet
 *.log
+*.npz
+*.json
 .DS_Store

@@ -1,11 +1,12 @@
 import polars as pl
 import numpy as np
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, save_npz
 from implicit.als import AlternatingLeastSquares
 
 def build_csr_matrix():
     """
     Creates a sparse user-item matrix whose rows are playlists and columns are tracks.
+
     return: csr_matrix user-item matrix
     """
     print('Connecting to PostgreSQL database...')
@@ -32,13 +33,19 @@ def build_csr_matrix():
 def train_als_model(user_item_matrix):
     """
     Trains an Alternating Least Squares factorization model with a given user-item matrix.
-    param user_item_matrix: the csr_matrix user-item matrix the model is trained on
+
+    param user_item_matrix: compressed sparse matrix of playlist-track interactions
     """
     print('Training ALS Matrix Factorization model...')
     # 50 latent features
     model = AlternatingLeastSquares(factors=50, iterations=15, regularization=0.01)
     model.fit(user_item_matrix)
     print('Training complete!')
+
+    print('Saving model...')
+    model.save('als_model.npz')
+    save_npz('user_item_matrix.npz', user_item_matrix)
+    print('ALS model saved!')
 
     # # Test retrieval
     # target_index=0
