@@ -127,15 +127,19 @@ gets right. Reports Recall@K and NDCG@K for each arm, with a paired t-test again
   python eval/evaluate.py --n-playlists 2000 --holdout-frac 0.2 --k 20
   ```
 
-* **[`eval/ab_test_sim.py`](eval/ab_test_sim.py)** simulates a proper A/B/C test across the same three arms. It runs
-a small pilot sample first to estimate baseline rates and variance, prints a power analysis (minimum detectable
-effect at the requested sample size, and the sample size actually required to hit a target lift) before touching
-the full data, and then reports results using the paired tests that fit a design where every playlist is scored
-under all three arms: McNemar's test for the binary hit-rate metric, paired t-tests for the continuous ones, plus
-a paired bootstrap CI on each as a cross-check.
+* **[`eval/ab_test_sim.py`](eval/ab_test_sim.py)** is the live-experiment counterpart to `evaluate.py`. Where
+`evaluate.py` scores every playlist under every arm and uses paired tests (a within-subjects offline comparison),
+this script simulates what a real A/B test can actually do: it assigns each playlist to **exactly one** arm — a
+between-subjects, one-arm-per-playlist split — and compares arms with independent-sample tests (Welch's t-test for
+the continuous metrics, a two-proportion z-test for the binary hit rate). It runs a small pilot first (scored under
+all arms) to estimate each arm's rate and variance, prints a power analysis (minimum detectable effect at the
+planned sample size, and the per-arm sample size actually required to hit a target lift) before touching the full
+data, and sizes the full run to ~3× the required per-arm n. A side benefit of the one-arm-per-playlist design: only
+~1/3 of playlists run the expensive full-engine pipeline, so it's substantially cheaper than scoring every arm on
+every playlist.
 
   ```bash
-  python eval/ab_test_sim.py --n-playlists 2000 --k 20 --pilot-n 200
+  python eval/ab_test_sim.py --n-playlists 3000 --k 20 --pilot-n 200
   ```
 
 ## Running the Pipeline
@@ -186,6 +190,6 @@ Once you have trained models, check whether they're actually earning their compl
 
 ```bash
 python eval/evaluate.py --n-playlists 2000 --holdout-frac 0.2 --k 20
-python eval/ab_test_sim.py --n-playlists 2000 --k 20 --pilot-n 200
+python eval/ab_test_sim.py --n-playlists 3000 --k 20 --pilot-n 200
 ```
 

@@ -27,6 +27,7 @@ def _connection(conn):
 
 
 def get_live_recommendations(track_ids, als_model, user_item_matrix, num_recs=20, conn=None):
+    """Cold start: gets candidates from the ALS model from a list of track IDs, not a playlist index from the database."""
     track_int_query = """
         SELECT track_int_id
         FROM interaction_matrix_mapped
