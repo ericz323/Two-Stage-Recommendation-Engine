@@ -1,9 +1,22 @@
 import polars as pl
 import psycopg
+from contextlib import contextmanager
 
 DB_URI = 'postgresql://postgres:postgres123@localhost:5432/playlist_engine'
 
-def generate_features(target, candidate_track_int_ids):
+
+@contextmanager
+def _connection(conn):
+    """Uses `conn` if the caller supplied one (e.g. reusing one connection across
+    a whole eval run), otherwise opens and closes a fresh one for this call."""
+    if conn is not None:
+        yield conn
+    else:
+        with psycopg.connect(DB_URI) as local_conn:
+            yield local_conn
+
+
+def generate_features(target, candidate_track_int_ids, conn=None):
     """
     Creates features from track metadata to be used for ranking candidates by the gradient boosting model.
 
@@ -75,7 +88,7 @@ def generate_features(target, candidate_track_int_ids):
     else:
         raise TypeError(f"target must be an int (playlist_int_id) or list (seed track_ids), got {type(target)}")
 
-    with psycopg.connect(DB_URI) as conn, conn.cursor() as cur:
+    with _connection(conn) as active_conn, active_conn.cursor() as cur:
         cur.execute(item_query, (candidate_ids,))
         item_rows = cur.fetchall()
         item_columns = [desc.name for desc in cur.description]

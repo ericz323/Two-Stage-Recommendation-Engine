@@ -28,7 +28,7 @@ from implicit.als import AlternatingLeastSquares
 from scipy import stats
 from scipy.sparse import load_npz
 
-from src.recommend import generate_recommendations, get_als_only_recommendations
+from src.recommend import get_als_candidates, rank_candidates, get_als_only_recommendations
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = PROJECT_ROOT / 'models'
@@ -117,17 +117,27 @@ def ndcg_at_k(recommended, held_out, k=20):
     return dcg / idcg if idcg > 0 else 0.0
 
 
-def get_recommendations(seed_track_ids, als_model, user_item_matrix, xgb_model, k=20):
+def get_engine_and_als_recommendations(seed_track_ids, als_model, user_item_matrix, xgb_model, k=20, conn=None):
     """
-    Full engine: ALS retrieval (Stage 1) + XGBRanker reranking (Stage 2).
-    Returns a ranked list of track_id strings, length k.
+    Runs Stage 1 (ALS retrieval) ONCE and derives both the full engine's
+    reranked recommendations and the ALS-only ablation's recommendations from
+    it, instead of retrieving twice for the same seed tracks -- ALS scores
+    every item once and returns the top-N by score, so the ALS-only arm's
+    top-k is always identical to the head of the full engine's larger
+    candidate pool.
+
+    Returns: (recs_full, recs_als), both ranked lists of track_id strings, length k.
     """
-    df_recs = generate_recommendations(seed_track_ids, als_model, user_item_matrix, xgb_model, k=k)
-    return df_recs['track_id'].to_list()
+    candidate_integers, _als_scores = get_als_candidates(seed_track_ids, als_model, user_item_matrix, n=200, conn=conn)
+    df_recs = rank_candidates(seed_track_ids, candidate_integers, xgb_model, k=k, conn=conn)
+    recs_full = df_recs['track_id'].to_list()
+    recs_als = get_als_only_recommendations(
+        seed_track_ids, als_model, user_item_matrix, k=k, candidate_integers=candidate_integers, conn=conn)
+    return recs_full, recs_als
 
 
 def evaluate_pipeline(playlists, als_model, user_item_matrix, xgb_model, k=20,
-                       holdout_frac=0.2, popularity_baseline=None, seed=None):
+                       holdout_frac=0.2, popularity_baseline=None, seed=None, conn=None):
     """
     Runs the full two-stage engine, the ALS-only baseline (no reranking),
     and a popularity baseline over the same held-out splits.
@@ -138,13 +148,11 @@ def evaluate_pipeline(playlists, als_model, user_item_matrix, xgb_model, k=20,
         print(f"Evaluating playlist {index + 1} of {len(playlists)}")
         seed_tracks, held_out = split_holdout(track_ids, holdout_frac, seed=stable_seed(pid, seed))
 
-        # --- Full two-stage engine (ALS retrieval + XGBRanker reranking) ---
-        recs_full = get_recommendations(seed_tracks, als_model, user_item_matrix, xgb_model, k=k)
+        # --- Full two-stage engine + ALS-only (retrieval, no reranking) ---
+        recs_full, recs_als = get_engine_and_als_recommendations(
+            seed_tracks, als_model, user_item_matrix, xgb_model, k=k, conn=conn)
         results["engine_recall"].append(recall_at_k(recs_full, held_out, k))
         results["engine_ndcg"].append(ndcg_at_k(recs_full, held_out, k))
-
-        # --- ALS-only (retrieval, no reranking) ---
-        recs_als = get_als_only_recommendations(seed_tracks, als_model, user_item_matrix, k=k)
         results["als_only_recall"].append(recall_at_k(recs_als, held_out, k))
         results["als_only_ndcg"].append(ndcg_at_k(recs_als, held_out, k))
 
@@ -225,6 +233,7 @@ def main():
         holdout_frac=args.holdout_frac,
         popularity_baseline=popularity_baseline,
         seed=args.seed,
+        conn=conn,
     )
     summarize(results)
     conn.close()
