@@ -1,8 +1,12 @@
 import polars as pl
 import xgboost as xgb
 import numpy as np
+from pathlib import Path
 
 DB_URI = "postgresql://postgres:postgres123@localhost:5432/playlist_engine"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent  # src/ -> project root
+MODELS_DIR = PROJECT_ROOT / 'models'
+MODELS_DIR.mkdir(exist_ok=True)
 
 def fetch_training_data():
     """
@@ -133,7 +137,7 @@ def train_ranker():
 
     # Save XGBoost model
     print('Saving model...')
-    ranker.save_model('xgb_ranker.json')
+    ranker.save_model(str(MODELS_DIR / 'xgb_ranker.json'))
     print('XGBRanker model saved!')
 
     return ranker

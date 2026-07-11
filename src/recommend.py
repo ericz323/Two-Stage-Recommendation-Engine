@@ -1,43 +1,124 @@
+import argparse
 import polars as pl
+import numpy as np
+import psycopg
 import xgboost as xgb
+from contextlib import contextmanager
 from implicit.als import AlternatingLeastSquares
-from scipy.sparse import load_npz
+from scipy.sparse import csr_matrix, load_npz
+from pathlib import Path
 
-from feature_engineering import generate_features
+from src.feature_engineering import generate_features
 
-print('Loading models into memory...')
-als_model = AlternatingLeastSquares().load('als_model.npz')
-user_item_matrix = load_npz('user_item_matrix.npz')
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MODELS_DIR = PROJECT_ROOT / 'models'
+DB_URI = 'postgresql://postgres:postgres123@localhost:5432/playlist_engine'
 
-xgb_model = xgb.XGBRanker()
-xgb_model.load_model('xgb_ranker.json')
 
-def generate_recommendations(target_playlist_int_id, als_model, user_item_matrix, xgb_model):
+@contextmanager
+def _connection(conn):
+    """Uses `conn` if the caller supplied one (e.g. reusing one connection across
+    a whole eval run), otherwise opens and closes a fresh one for this call."""
+    if conn is not None:
+        yield conn
+    else:
+        with psycopg.connect(DB_URI) as local_conn:
+            yield local_conn
+
+
+def get_live_recommendations(track_ids, als_model, user_item_matrix, num_recs=20, conn=None):
+    track_int_query = """
+        SELECT track_int_id
+        FROM interaction_matrix_mapped
+        WHERE track_id = ANY(%s)
     """
-    Generates top 20 song recommendations for a given playlist.
+    with _connection(conn) as active_conn, active_conn.cursor() as cur:
+        cur.execute(track_int_query, (list(track_ids),))
+        track_ints = [row[0] for row in cur.fetchall()]
 
-    param target_playlist_int_id: mapped integer index for playlist of interest
-    param als_model: trained alternating least squares model
-    param user_item_matrix: compressed sparse matrix of playlist-track interactions
-    param xgb_model: trained gradient boosting ranking model
-    return: dataframe of recommendations for a given playlist
-    """
-    print(f'Generating recommendations for playlist {target_playlist_int_id}...')
+    data = np.ones(len(track_ints))
+    rows = np.zeros(len(track_ints))
+    cols = np.array(track_ints)
+    user_items = csr_matrix((data, (rows, cols)), shape=(1, user_item_matrix.shape[1]))
 
-    # 1. Retrieval
-    print('[1/4] Running vector retrieval...')
     candidate_integers, als_scores = als_model.recommend(
-        userid = target_playlist_int_id,
-        user_items = user_item_matrix[target_playlist_int_id],
-        N=200
+        userid=0,
+        user_items=user_items,
+        N=num_recs,
+        recalculate_user=True
     )
 
-    # 2. Feature engineering
-    print('[2/4] Engineering cross-features...')
-    df_features = generate_features(target_playlist_int_id, candidate_integers)
+    return candidate_integers, als_scores
 
-    # 3. Ranking
-    print('[3/4] Ranking candidates...')
+
+def get_als_candidates(target, als_model, user_item_matrix, n=200, conn=None):
+    """
+    Runs Stage 1 (ALS retrieval) only, for either an existing playlist_int_id
+    (int) or an arbitrary list of seed track_ids. Shared by generate_recommendations
+    and get_als_only_recommendations so both paths retrieve candidates identically.
+
+    return: (candidate_integers, als_scores), already ranked by ALS score descending
+    """
+    if isinstance(target, int):
+        candidate_integers, als_scores = als_model.recommend(
+            userid=target,
+            user_items=user_item_matrix[target],
+            N=n
+        )
+    elif isinstance(target, list):
+        candidate_integers, als_scores = get_live_recommendations(target, als_model, user_item_matrix, num_recs=n, conn=conn)
+    else:
+        raise TypeError(f"target must be an int (playlist_int_id) or list (seed track_ids), got {type(target)}")
+
+    return candidate_integers, als_scores
+
+
+def map_track_ints_to_ids(candidate_integers, conn=None):
+    """
+    Maps ALS's internal track_int_id candidates back to track_id strings,
+    preserving the input (ALS-ranked) order.
+    """
+    query = """
+        SELECT DISTINCT track_int_id, track_id
+        FROM interaction_matrix_mapped
+        WHERE track_int_id = ANY(%s)
+    """
+    candidate_ids = [int(i) for i in candidate_integers]
+    with _connection(conn) as active_conn, active_conn.cursor() as cur:
+        cur.execute(query, (candidate_ids,))
+        int_to_id = {row[0]: row[1] for row in cur.fetchall()}
+
+    return [int_to_id[int(i)] for i in candidate_integers if int(i) in int_to_id]
+
+
+def get_als_only_recommendations(target, als_model, user_item_matrix, k=20, candidate_integers=None, conn=None):
+    """
+    Stage 1 (ALS retrieval) ONLY -- skips XGBRanker reranking entirely.
+    Isolates whether Stage 2 reranking is adding value over raw ALS retrieval.
+
+    param target: playlist_int_id (int) or list of seed track_ids
+    param candidate_integers: an already-retrieved Stage-1 candidate pool (e.g.
+        from generate_recommendations' call to get_als_candidates for the same
+        target) to slice instead of retrieving again -- ALS scores every item
+        once and returns the top-N by score, so a larger pool's top-k is
+        identical to requesting N=k directly.
+    return: list of track_id strings, ranked by ALS score, length k
+    """
+    if candidate_integers is None:
+        candidate_integers, _als_scores = get_als_candidates(target, als_model, user_item_matrix, n=k, conn=conn)
+    return map_track_ints_to_ids(candidate_integers[:k], conn=conn)
+
+
+def rank_candidates(target, candidate_integers, xgb_model, k=20, conn=None):
+    """
+    Stage 2 (XGBRanker reranking) only: feature engineering + scoring for an
+    already-retrieved candidate pool. Split out of generate_recommendations so
+    callers that also need the raw Stage-1 candidates (e.g. an ALS-only arm
+    scored alongside the full engine) can reuse the same retrieval instead of
+    running Stage 1 twice for the same target.
+    """
+    df_features = generate_features(target, candidate_integers, conn=conn)
+
     feature_columns = [
         'track_danceability',
         'track_tempo',
@@ -57,21 +138,43 @@ def generate_recommendations(target_playlist_int_id, als_model, user_item_matrix
     xgb_scores = xgb_model.predict(X_inf)
 
     df_ranked = df_features.with_columns(pl.Series('xgb_score', xgb_scores))
-    df_top_20 = df_ranked.sort('xgb_score', descending=True).head(20)
+    return df_ranked.sort('xgb_score', descending=True).head(k)
 
-    # 4. Presentation
-    print('[4/4] Generating output...')
-    DB_URI = 'postgresql://postgres:postgres123@localhost:5432/playlist_engine'
 
-    final_track_ids = ', '.join(f"'{tid}'" for tid in df_top_20['track_id'].to_list())
+def generate_recommendations(target, als_model, user_item_matrix, xgb_model, k=20, conn=None):
+    """
+    Generates top-k song recommendations for a given playlist.
 
-    name_query = f"""
+    param target_playlist_int_id: mapped integer index for playlist of interest
+    param als_model: trained alternating least squares model
+    param user_item_matrix: compressed sparse matrix of playlist-track interactions
+    param xgb_model: trained gradient boosting ranking model
+    param k: number of final recommendations to return
+    return: dataframe of recommendations for a given playlist
+    """
+    print('Generating recommendations...')
+
+    # 1. Retrieval
+    print('[1/2] Creating candidates...')
+    candidate_integers, als_scores = get_als_candidates(target, als_model, user_item_matrix, n=200, conn=conn)
+
+    print('[2/2] Ranking candidates...')
+    return rank_candidates(target, candidate_integers, xgb_model, k=k, conn=conn)
+
+
+def report(top_20, conn=None):
+    print("Generating output...")
+
+    name_query = """
         SELECT track_id, track_name, artist_name
         FROM track_metadata
-        WHERE track_id IN ({final_track_ids})
+        WHERE track_id = ANY(%s)
     """
-    df_names = pl.read_database_uri(query=name_query, uri=DB_URI, engine='connectorx')
-    df_presentation = df_top_20.join(df_names, on='track_id', how='left').sort('xgb_score', descending=True)
+    with _connection(conn) as active_conn, active_conn.cursor() as cur:
+        cur.execute(name_query, (top_20['track_id'].to_list(),))
+        rows = cur.fetchall()
+    df_names = pl.DataFrame(rows, schema=['track_id', 'track_name', 'artist_name'], orient='row')
+    df_presentation = top_20.join(df_names, on='track_id', how='left').sort('xgb_score', descending=True)
 
     print('\n=======================================================')
     print('YOUR RECOMMENDATIONS')
@@ -79,11 +182,38 @@ def generate_recommendations(target_playlist_int_id, als_model, user_item_matrix
     print(df_presentation.select(['artist_name', 'track_name', 'xgb_score']))
     print('=======================================================\n')
 
-    return df_presentation
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Generate track recommendations for a playlist.')
+    target_group = parser.add_mutually_exclusive_group(required=True)
+    target_group.add_argument(
+        '--playlist-id',
+        type=int,
+        help='Mapped integer playlist_int_id of an existing playlist.'
+    )
+    target_group.add_argument(
+        '--track-ids',
+        nargs='+',
+        help='One or more seed track IDs (space-separated) to recommend from.'
+    )
+    parser.add_argument(
+        '-k', '--num-recs',
+        type=int,
+        default=20,
+        help='Number of recommendations to return (default: 20).'
+    )
+    return parser.parse_args()
 
 
 if __name__ == '__main__':
-    # Test with Playlist ID 0
-    test_playlist_int_id = 0
+    args = parse_args()
+    target = args.playlist_id if args.playlist_id is not None else args.track_ids
 
-    generate_recommendations(test_playlist_int_id, als_model, user_item_matrix, xgb_model)
+    print('Loading models into memory...')
+    als_model = AlternatingLeastSquares().load(str(MODELS_DIR / 'als_model.npz'))
+    user_item_matrix = load_npz(str(MODELS_DIR / 'user_item_matrix.npz'))
+    xgb_model = xgb.XGBRanker()
+    xgb_model.load_model(str(MODELS_DIR / 'xgb_ranker.json'))
+
+    top_20 = generate_recommendations(target, als_model, user_item_matrix, xgb_model, k=args.num_recs)
+    report(top_20)

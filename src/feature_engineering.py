@@ -1,6 +1,22 @@
 import polars as pl
+import psycopg
+from contextlib import contextmanager
 
-def generate_features(target_playlist_int_id, candidate_track_int_ids):
+DB_URI = 'postgresql://postgres:postgres123@localhost:5432/playlist_engine'
+
+
+@contextmanager
+def _connection(conn):
+    """Uses `conn` if the caller supplied one (e.g. reusing one connection across
+    a whole eval run), otherwise opens and closes a fresh one for this call."""
+    if conn is not None:
+        yield conn
+    else:
+        with psycopg.connect(DB_URI) as local_conn:
+            yield local_conn
+
+
+def generate_features(target, candidate_track_int_ids, conn=None):
     """
     Creates features from track metadata to be used for ranking candidates by the gradient boosting model.
 
@@ -8,53 +24,81 @@ def generate_features(target_playlist_int_id, candidate_track_int_ids):
     param candidate_track_int_ids: mapped integer indices of track candidates from the ALS model
     return: dataframe with features of interest
     """
-    print(f'Extracting features for playlist int ID {target_playlist_int_id}...')
+    print(f'Extracting features...')
 
-    DB_URI = 'postgresql://postgres:postgres123@localhost:5432/playlist_engine'
-
-    id_list_str = ', '.join(map(str, candidate_track_int_ids))
+    candidate_ids = [int(i) for i in candidate_track_int_ids]
 
     # Item-only features: candidate metadata
-    item_query = f"""
-        SELECT 
+    item_query = """
+        SELECT
             track_id,
             danceability AS track_danceability,
             tempo AS track_tempo,
             energy AS track_energy,
-            acousticness AS track_acousticness, 
-            loudness AS track_loudness, 
+            acousticness AS track_acousticness,
+            loudness AS track_loudness,
             valence AS track_valence
         FROM track_metadata
         WHERE track_id IN (
             SELECT DISTINCT track_id
             FROM interaction_matrix_mapped
-            WHERE track_int_id IN ({id_list_str})
+            WHERE track_int_id = ANY(%s)
         )
     """
-    df_items = pl.read_database_uri(query=item_query, uri=DB_URI, engine='connectorx')
 
     # User-only features: metadata averages across playlist
-    user_query = f"""
-        SELECT
-            i.playlist_id,
-            AVG(m.danceability) AS avg_danceability,
-            AVG(m.tempo) AS avg_tempo,
-            AVG(m.energy) AS avg_energy,
-            AVG(m.acousticness) AS avg_acousticness,
-            AVG(m.loudness) AS avg_loudness,
-            AVG(m.valence) AS avg_valence,
-            COUNT(i.track_id) AS playlist_length
-        FROM interaction_matrix i
-        JOIN track_metadata m ON i.track_id = m.track_id
-        WHERE i.playlist_id = (
-            SELECT playlist_id
-            FROM interaction_matrix_mapped
-            WHERE playlist_int_id = {target_playlist_int_id}
-            LIMIT 1
-        )
-        GROUP BY i.playlist_id
-    """
-    df_user = pl.read_database_uri(query=user_query, uri=DB_URI, engine='connectorx')
+    if isinstance(target, int):
+        user_query = """
+            SELECT
+                i.playlist_id,
+                AVG(m.danceability) AS avg_danceability,
+                AVG(m.tempo) AS avg_tempo,
+                AVG(m.energy) AS avg_energy,
+                AVG(m.acousticness) AS avg_acousticness,
+                AVG(m.loudness) AS avg_loudness,
+                AVG(m.valence) AS avg_valence,
+                COUNT(i.track_id) AS playlist_length
+            FROM interaction_matrix i
+            JOIN track_metadata m ON i.track_id = m.track_id
+            WHERE i.playlist_id = (
+                SELECT playlist_id
+                FROM interaction_matrix_mapped
+                WHERE playlist_int_id = %s
+                LIMIT 1
+            )
+            GROUP BY i.playlist_id
+        """
+        user_params = (target,)
+
+    elif isinstance(target, list):
+        user_query = """
+            SELECT
+                AVG(danceability) AS avg_danceability,
+                AVG(tempo) AS avg_tempo,
+                AVG(energy) AS avg_energy,
+                AVG(acousticness) AS avg_acousticness,
+                AVG(loudness) AS avg_loudness,
+                AVG(valence) AS avg_valence,
+                COUNT(*) AS playlist_length
+            FROM track_metadata
+            WHERE track_id = ANY(%s)
+        """
+        user_params = (target,)
+
+    else:
+        raise TypeError(f"target must be an int (playlist_int_id) or list (seed track_ids), got {type(target)}")
+
+    with _connection(conn) as active_conn, active_conn.cursor() as cur:
+        cur.execute(item_query, (candidate_ids,))
+        item_rows = cur.fetchall()
+        item_columns = [desc.name for desc in cur.description]
+
+        cur.execute(user_query, user_params)
+        user_rows = cur.fetchall()
+        user_columns = [desc.name for desc in cur.description]
+
+    df_items = pl.DataFrame(item_rows, schema=item_columns, orient='row')
+    df_user = pl.DataFrame(user_rows, schema=user_columns, orient='row')
 
     # Cross features
     print('Create cross features...')
@@ -72,9 +116,12 @@ def generate_features(target_playlist_int_id, candidate_track_int_ids):
 
     return df_features
 
+
+
+
 if __name__ == '__main__':
     # Test
-    test_playlist_id = 0
+    test_playlist_id = ['0UaMYEvWZi0ZqiDOoHU3YI','6I9VzXrHxO9rA9A5euc8Ak','0WqIKmW4BTrj3eJFmnCKMv','1AWQoqb9bSvzTjaLralEkT']
     mock_candidates = [101, 205, 310, 450, 512]
 
     df_ranking_dataset = generate_features(test_playlist_id, mock_candidates)
