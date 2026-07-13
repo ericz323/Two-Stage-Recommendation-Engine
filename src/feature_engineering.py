@@ -12,38 +12,50 @@ def _connection(conn):
     if conn is not None:
         yield conn
     else:
-        with psycopg.connect(DB_URI) as local_conn:
+        # prepare_threshold=None: never auto-prepare, so `col = ANY($1)` queries are
+        # always planned with the actual array values (custom plan) and use the
+        # indexes, rather than risking a generic-plan seq scan. (A per-call
+        # connection here rarely repeats a query enough to prepare anyway, but a
+        # caller may pass in a long-lived shared conn -- see the eval scripts.)
+        with psycopg.connect(DB_URI, prepare_threshold=None) as local_conn:
             yield local_conn
 
 
-def generate_features(target, candidate_track_int_ids, conn=None):
+def generate_features(target, candidate_track_int_ids, als_scores, conn=None):
     """
     Creates features from track metadata to be used for ranking candidates by the gradient boosting model.
 
     param target_playlist_int_id: mapped integer index of playlist of interest
     param candidate_track_int_ids: mapped integer indices of track candidates from the ALS model
-    return: dataframe with features of interest
+    param als_scores: Stage-1 ALS retrieval score for each candidate (aligned with
+        candidate_track_int_ids). Attached as the `als_score` feature so the ranker
+        keeps the collaborative signal instead of reranking on acoustics alone.
+    return: dataframe with features of interest (one row per candidate)
     """
     print(f'Extracting features...')
 
     candidate_ids = [int(i) for i in candidate_track_int_ids]
 
-    # Item-only features: candidate metadata
+    # Item-only features: candidate metadata. Dedup the int->id mapping FIRST (<=200
+    # rows via idx_track_int), THEN join track_metadata -- otherwise a popular
+    # candidate (present in thousands of interaction rows) would explode the join
+    # before dedup. track_int_id is carried through so als_score can be joined on it.
     item_query = """
         SELECT
-            track_id,
-            danceability AS track_danceability,
-            tempo AS track_tempo,
-            energy AS track_energy,
-            acousticness AS track_acousticness,
-            loudness AS track_loudness,
-            valence AS track_valence
-        FROM track_metadata
-        WHERE track_id IN (
-            SELECT DISTINCT track_id
+            map.track_int_id,
+            t.track_id,
+            t.danceability AS track_danceability,
+            t.tempo AS track_tempo,
+            t.energy AS track_energy,
+            t.acousticness AS track_acousticness,
+            t.loudness AS track_loudness,
+            t.valence AS track_valence
+        FROM (
+            SELECT DISTINCT track_int_id, track_id
             FROM interaction_matrix_mapped
             WHERE track_int_id = ANY(%s)
-        )
+        ) map
+        JOIN track_metadata t ON map.track_id = t.track_id
     """
 
     # User-only features: metadata averages across playlist
@@ -100,6 +112,16 @@ def generate_features(target, candidate_track_int_ids, conn=None):
     df_items = pl.DataFrame(item_rows, schema=item_columns, orient='row')
     df_user = pl.DataFrame(user_rows, schema=user_columns, orient='row')
 
+    # Attach the ALS retrieval score to each candidate BY track_int_id (never
+    # positionally -- df_items comes back in DB order and drops metadata-less
+    # candidates, so positional alignment would be wrong).
+    df_scores = pl.DataFrame({
+        'track_int_id': [int(i) for i in candidate_track_int_ids],
+        'als_score': [float(s) for s in als_scores],
+    }).with_columns(pl.col('track_int_id').cast(pl.Int64))
+    df_items = df_items.with_columns(pl.col('track_int_id').cast(pl.Int64)).join(
+        df_scores, on='track_int_id', how='left')
+
     # Cross features
     print('Create cross features...')
 
@@ -123,8 +145,9 @@ if __name__ == '__main__':
     # Test
     test_playlist_id = ['0UaMYEvWZi0ZqiDOoHU3YI','6I9VzXrHxO9rA9A5euc8Ak','0WqIKmW4BTrj3eJFmnCKMv','1AWQoqb9bSvzTjaLralEkT']
     mock_candidates = [101, 205, 310, 450, 512]
+    mock_scores = [0.9, 0.8, 0.7, 0.6, 0.5]
 
-    df_ranking_dataset = generate_features(test_playlist_id, mock_candidates)
+    df_ranking_dataset = generate_features(test_playlist_id, mock_candidates, mock_scores)
 
     print('\nSuccessfully compiled ranking features!')
     print(df_ranking_dataset.head())

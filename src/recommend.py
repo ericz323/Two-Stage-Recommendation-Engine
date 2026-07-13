@@ -22,7 +22,12 @@ def _connection(conn):
     if conn is not None:
         yield conn
     else:
-        with psycopg.connect(DB_URI) as local_conn:
+        # prepare_threshold=None: never auto-prepare, so `col = ANY($1)` queries are
+        # always planned with the actual array values (custom plan) and use the
+        # indexes, rather than risking a generic-plan seq scan. (A per-call
+        # connection here rarely repeats a query enough to prepare anyway, but a
+        # caller may pass in a long-lived shared conn -- see the eval scripts.)
+        with psycopg.connect(DB_URI, prepare_threshold=None) as local_conn:
             yield local_conn
 
 
@@ -60,6 +65,7 @@ def get_als_candidates(target, als_model, user_item_matrix, n=200, conn=None):
 
     return: (candidate_integers, als_scores), already ranked by ALS score descending
     """
+    print('[1/2] Creating candidates...')
     if isinstance(target, int):
         candidate_integers, als_scores = als_model.recommend(
             userid=target,
@@ -110,15 +116,20 @@ def get_als_only_recommendations(target, als_model, user_item_matrix, k=20, cand
     return map_track_ints_to_ids(candidate_integers[:k], conn=conn)
 
 
-def rank_candidates(target, candidate_integers, xgb_model, k=20, conn=None):
+def rank_candidates(target, candidate_integers, als_scores, xgb_model, k=20, conn=None):
     """
     Stage 2 (XGBRanker reranking) only: feature engineering + scoring for an
     already-retrieved candidate pool. Split out of generate_recommendations so
     callers that also need the raw Stage-1 candidates (e.g. an ALS-only arm
     scored alongside the full engine) can reuse the same retrieval instead of
     running Stage 1 twice for the same target.
+
+    param als_scores: the Stage-1 ALS scores for candidate_integers (aligned),
+        passed through as the `als_score` ranking feature so the reranker keeps
+        the collaborative signal instead of reordering on acoustics alone.
     """
-    df_features = generate_features(target, candidate_integers, conn=conn)
+    print('[2/2] Ranking candidates...')
+    df_features = generate_features(target, candidate_integers, als_scores, conn=conn)
 
     feature_columns = [
         'track_danceability',
@@ -132,7 +143,8 @@ def rank_candidates(target, candidate_integers, xgb_model, k=20, conn=None):
         'energy_diff',
         'acousticness_diff',
         'loudness_diff',
-        'valence_diff'
+        'valence_diff',
+        'als_score'
     ]
     X_inf = df_features[feature_columns].to_pandas()
 
@@ -156,11 +168,9 @@ def generate_recommendations(target, als_model, user_item_matrix, xgb_model, k=2
     print('Generating recommendations...')
 
     # 1. Retrieval
-    print('[1/2] Creating candidates...')
     candidate_integers, als_scores = get_als_candidates(target, als_model, user_item_matrix, n=200, conn=conn)
 
-    print('[2/2] Ranking candidates...')
-    return rank_candidates(target, candidate_integers, xgb_model, k=k, conn=conn)
+    return rank_candidates(target, candidate_integers, als_scores, xgb_model, k=k, conn=conn)
 
 
 def report(top_20, conn=None):

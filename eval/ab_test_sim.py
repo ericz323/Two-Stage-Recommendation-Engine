@@ -473,7 +473,14 @@ if __name__ == "__main__":
 
     als_model, user_item_matrix, xgb_model = load_models()
 
-    conn = psycopg.connect(DB_URI)
+    # prepare_threshold=None: this connection is shared across the whole run, so the
+    # same query text runs thousands of times on it. psycopg3 would auto-prepare
+    # each after 5 executions, after which PostgreSQL can switch to a GENERIC plan
+    # for `col = ANY($1)` that can't see the array contents, misestimates
+    # selectivity, and seq-scans despite the indexes. Disabling preparation keeps
+    # every execute planned with the actual values (custom plan) -> uses the index.
+    # autocommit is fine for a read-only connection but is NOT the perf fix.
+    conn = psycopg.connect(DB_URI, autocommit=True, prepare_threshold=None)
 
     popularity_baseline = fetch_global_popularity(conn, top_n=args.k)
 
