@@ -70,7 +70,7 @@ from eval.evaluate import (
 )
 from src.recommend import get_als_candidates, rank_candidates, get_als_only_recommendations
 
-PILOT_N = 100  # playlists used to estimate per-arm stats before the full simulation
+PILOT_N = 200  # playlists used to estimate per-arm stats before the full simulation
 
 # index % 3 -> arm, for the one-arm-per-playlist assignment in the full simulation.
 # The fetch is already seed-shuffled, so this is an effectively-random 3-way split.
@@ -364,8 +364,8 @@ def run_simulation(playlists, als_model, user_item_matrix, xgb_model, popularity
         seed_tracks, held_out = split_holdout(track_ids, holdout_frac, seed=stable_seed(pid, seed))
 
         if arm == "treatment":
-            candidate_integers, _als_scores = get_als_candidates(seed_tracks, als_model, user_item_matrix, n=200, conn=conn)
-            recs = rank_candidates(seed_tracks, candidate_integers, xgb_model, k=k, conn=conn)["track_id"].to_list()
+            candidate_integers, als_scores = get_als_candidates(seed_tracks, als_model, user_item_matrix, n=200, conn=conn)
+            recs = rank_candidates(seed_tracks, candidate_integers, als_scores, xgb_model, k=k, conn=conn)["track_id"].to_list()
         elif arm == "als":
             recs = get_als_only_recommendations(seed_tracks, als_model, user_item_matrix, k=k, conn=conn)
         else:  # control
@@ -457,7 +457,7 @@ if __name__ == "__main__":
                               "fewer than the required per-arm n, the run proceeds but is flagged as "
                               "underpowered.")
     parser.add_argument("--k", type=int, default=20)
-    parser.add_argument("--holdout-frac", type=float, default=0.2)
+    parser.add_argument("--holdout-frac", type=float, default=0.3)
     parser.add_argument("--pilot-n", type=int, default=PILOT_N)
     parser.add_argument("--target-mde-hit-rate", type=float, default=0.03,
                          help="Minimum absolute lift in hit rate worth detecting (default: 0.03 = 3pp)")
@@ -469,9 +469,13 @@ if __name__ == "__main__":
                          help="Seed for playlist sampling and holdout splits, for reproducible "
                               "runs. The pilot and full sample use seed and seed+1 respectively, "
                               "so they stay independent even though both are deterministic.")
+    parser.add_argument("--ranker-path", type=str, default=None,
+                         help="Path to the XGBRanker model to run as the treatment arm "
+                              "(default: models/xgb_ranker.json). Point at e.g. "
+                              "models/xgb_ranker_hard.json vs _random.json to A/B the rankers.")
     args = parser.parse_args()
 
-    als_model, user_item_matrix, xgb_model = load_models()
+    als_model, user_item_matrix, xgb_model = load_models(ranker_path=args.ranker_path)
 
     # prepare_threshold=None: this connection is shared across the whole run, so the
     # same query text runs thousands of times on it. psycopg3 would auto-prepare

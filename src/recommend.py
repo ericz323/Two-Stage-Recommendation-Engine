@@ -116,7 +116,7 @@ def get_als_only_recommendations(target, als_model, user_item_matrix, k=20, cand
     return map_track_ints_to_ids(candidate_integers[:k], conn=conn)
 
 
-def rank_candidates(target, candidate_integers, als_scores, xgb_model, k=20, conn=None):
+def rank_candidates(target, candidate_integers, als_scores, xgb_model, k=20, conn=None, return_full=False):
     """
     Stage 2 (XGBRanker reranking) only: feature engineering + scoring for an
     already-retrieved candidate pool. Split out of generate_recommendations so
@@ -127,6 +127,9 @@ def rank_candidates(target, candidate_integers, als_scores, xgb_model, k=20, con
     param als_scores: the Stage-1 ALS scores for candidate_integers (aligned),
         passed through as the `als_score` ranking feature so the reranker keeps
         the collaborative signal instead of reordering on acoustics alone.
+    param return_full: if True, return the FULL scored candidate frame (sorted,
+        with the `xgb_score` column) instead of just the top-k -- for debugging the
+        reranker's score distribution.
     """
     print('[2/2] Ranking candidates...')
     df_features = generate_features(target, candidate_integers, als_scores, conn=conn)
@@ -150,8 +153,15 @@ def rank_candidates(target, candidate_integers, als_scores, xgb_model, k=20, con
 
     xgb_scores = xgb_model.predict(X_inf)
 
-    df_ranked = df_features.with_columns(pl.Series('xgb_score', xgb_scores))
-    return df_ranked.sort('xgb_score', descending=True).head(k)
+    # Tie-break by als_score: XGBRanker often gives many candidates identical scores
+    # (same leaves). Without a tie-break the stable sort falls back to DB row order,
+    # which is relevance-blind and can scramble ALS's good ordering -- making the
+    # engine do WORSE than ALS-only. Breaking ties by als_score means flat/tied
+    # regions fall back to ALS (retrieval) order, so reranking can't underperform
+    # ALS-only just from arbitrary tie-breaking.
+    df_ranked = df_features.with_columns(pl.Series('xgb_score', xgb_scores)).sort(
+        ['xgb_score', 'als_score'], descending=True)
+    return df_ranked if return_full else df_ranked.head(k)
 
 
 def generate_recommendations(target, als_model, user_item_matrix, xgb_model, k=20, conn=None):
@@ -224,7 +234,7 @@ if __name__ == '__main__':
     als_model = AlternatingLeastSquares().load(str(MODELS_DIR / 'als_model.npz'))
     user_item_matrix = load_npz(str(MODELS_DIR / 'user_item_matrix.npz'))
     xgb_model = xgb.XGBRanker()
-    xgb_model.load_model(str(MODELS_DIR / 'xgb_ranker.json'))
+    xgb_model.load_model(str(MODELS_DIR / 'xgb_ranker_hard.json'))
 
     top_20 = generate_recommendations(target, als_model, user_item_matrix, xgb_model, k=args.num_recs)
     report(top_20)

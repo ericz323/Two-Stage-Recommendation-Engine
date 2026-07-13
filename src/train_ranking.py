@@ -5,21 +5,27 @@ Trains the Stage 2 XGBRanker that reranks the ALS retrieval candidates.
 Trained the SAME way it is served ("train like you serve"). For each playlist we
 hide a fraction of its tracks (the TARGET), retrieve candidates from the
 remaining SEED tracks via the exact cold-start path inference uses
-(recalculate_user), and label each retrieved candidate 1 if it is a hidden
-target track and 0 otherwise. So:
+(recalculate_user), and label each candidate 1 if it is a hidden target and 0
+otherwise. The taste profile (avg_*) is computed over the SEED tracks only (never
+the labeled targets), and als_score is the recalculate_user retrieval score --
+identical in origin to the als_score feature at inference. So there is no profile
+circularity and no train/serve skew in als_score.
 
-  - Negatives are HARD negatives -- tracks ALS retrieved from the seed that are
-    not actually held-out targets -- the same pool the ranker reorders at serving.
-  - The taste profile (avg_*) is computed over the SEED tracks only, never the
-    labeled targets, so the *_diff cross-features mean the same thing at train and
-    serve time (no "positives define their own centroid" circularity).
-  - als_score is the recalculate_user retrieval score -- identical in origin to
-    the als_score feature computed at inference -- so there is no train/serve skew
-    in that feature either.
+Two negative-sampling strategies can be trained and saved separately, to compare
+side-by-side. Everything else is held identical -- same playlists, same
+seed/target split, same positives, same features -- so this isolates the
+negative-sampling variable:
+  - hard   : negatives are ALS-retrieved tracks that are NOT held-out targets
+             (the pool the ranker actually reorders at serving).
+  - random : negatives are random catalog tracks not in the playlist.
 
 Because positives are only the retrieved held-out targets, most playlists yield
 few (or zero) positives; playlists with none are dropped. Increase --n-playlists
-or --n-candidates to get more positive coverage.
+or --n-candidates for more positive coverage.
+
+Run:
+    python src/train_ranking.py --negatives both
+    python src/train_ranking.py --negatives hard --out models/xgb_ranker.json
 """
 
 import argparse
@@ -42,8 +48,8 @@ MODELS_DIR.mkdir(exist_ok=True)
 N_TRAIN_PLAYLISTS = 10000  # playlists sampled for training
 N_CANDIDATES = 200         # ALS candidates retrieved per playlist (matches inference pool)
 HOLDOUT_FRAC = 0.2         # fraction of each playlist hidden as targets (matches eval)
-N_NEG_PER_PLAYLIST = 50    # hard negatives kept per playlist (highest-scored)
-SEED = 42                  # seed for the per-playlist seed/target split
+N_NEG_PER_PLAYLIST = 50    # negatives kept per playlist (per strategy)
+SEED = 42                  # seed for the per-playlist seed/target split + random negatives
 
 TRACK_FEATURES = [
     'track_danceability',
@@ -71,6 +77,10 @@ DIFF_FEATURES = [
 ]
 # Order MUST match feature_columns in src/recommend.py (rank_candidates).
 FEATURE_COLUMNS = TRACK_FEATURES + DIFF_FEATURES + ['als_score']
+
+# Cache for whether implicit's recommend() supports the items= kwarg (used to score
+# random negatives under the recalculated user factor). None = not yet probed.
+_ITEMS_PARAM_OK = None
 
 
 # Local copies of eval/evaluate.py's split_holdout + stable_seed -- kept local so
@@ -103,16 +113,87 @@ def load_als():
     return als_model, user_item_matrix
 
 
-def fetch_training_data(als_model, user_item_matrix, conn, n_playlists=N_TRAIN_PLAYLISTS,
-                        n_candidates=N_CANDIDATES, holdout_frac=HOLDOUT_FRAC,
-                        n_neg=N_NEG_PER_PLAYLIST, seed=SEED):
-    """
-    Builds the labeled training set by mirroring the serving path per playlist:
-    split tracks into seed/target, retrieve candidates from the seed via
-    recalculate_user, label a candidate 1 iff it is a held-out target.
+def _sample_random_negatives(rng, n_items, exclude, n_neg):
+    """Rejection-sample up to n_neg distinct track_ints in [0, n_items) not in `exclude`."""
+    out, seen, attempts = [], set(), 0
+    while len(out) < n_neg and attempts < n_neg * 20:
+        t = int(rng.integers(0, n_items))
+        attempts += 1
+        if t in exclude or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return np.asarray(out, dtype=np.int64)
 
-    return: polars df with playlist_int_id, label, als_score, the six track_*
-            acoustic features, and the six avg_* seed-profile features.
+
+def _score_items_recalc(als_model, seed_row, item_tints, pid):
+    """
+    ALS score for `item_tints` under the SAME recalculated user factor inference
+    uses -- via recommend(items=...). Falls back to the trained playlist factor's
+    dot product if this implicit build has no items= kwarg (a minor train/serve
+    skew for the random negatives only).
+    """
+    global _ITEMS_PARAM_OK
+    item_tints = np.asarray(item_tints)
+    if len(item_tints) == 0:
+        return np.asarray([], dtype=float)
+
+    if _ITEMS_PARAM_OK is not False:
+        try:
+            ids, scores = als_model.recommend(
+                0, seed_row, items=item_tints, recalculate_user=True,
+                N=len(item_tints), filter_already_liked_items=False)
+            score_map = {int(i): float(s)
+                         for i, s in zip(np.asarray(ids).reshape(-1), np.asarray(scores).reshape(-1))}
+            if _ITEMS_PARAM_OK is None:
+                _ITEMS_PARAM_OK = True
+                print("[info] random-neg als_score via recalculate_user items= scoring.")
+            return np.asarray([score_map.get(int(t), 0.0) for t in item_tints], dtype=float)
+        except TypeError:
+            _ITEMS_PARAM_OK = False
+            print("[info] implicit recommend() has no items= kwarg; random-neg als_score "
+                  "falls back to trained-factor dot product.")
+
+    return (als_model.user_factors[pid] * als_model.item_factors[item_tints]).sum(axis=1)
+
+
+def _append_candidates(acc, pid, pos_tints, pos_scores, neg_tints, neg_scores):
+    """Append one playlist's positives (label 1) and negatives (label 0) to an accumulator."""
+    for t, s in zip(pos_tints, pos_scores):
+        acc['pl'].append(pid); acc['tint'].append(int(t)); acc['label'].append(1); acc['als'].append(float(s))
+    for t, s in zip(neg_tints, neg_scores):
+        acc['pl'].append(pid); acc['tint'].append(int(t)); acc['label'].append(0); acc['als'].append(float(s))
+
+
+def _build_strategy_df(acc, df_map, df_metadata, df_profiles):
+    """Assemble one strategy's candidate rows into the feature frame (map ids, join metadata + profile)."""
+    return (
+        pl.DataFrame({
+            'playlist_int_id': acc['pl'],
+            'track_int_id': acc['tint'],
+            'label': acc['label'],
+            'als_score': acc['als'],
+        })
+        .with_columns(pl.col('track_int_id').cast(pl.Int64), pl.col('als_score').cast(pl.Float64))
+        .join(df_map, on='track_int_id', how='inner')
+        .drop('track_int_id')
+        .join(df_metadata, on='track_id', how='inner')       # candidate track_* features
+        .join(df_profiles, on='playlist_int_id', how='inner')  # avg_* seed profile
+    )
+
+
+def fetch_training_data(als_model, user_item_matrix, conn, strategies,
+                        n_playlists=N_TRAIN_PLAYLISTS, n_candidates=N_CANDIDATES,
+                        holdout_frac=HOLDOUT_FRAC, n_neg=N_NEG_PER_PLAYLIST, seed=SEED):
+    """
+    Builds one labeled training frame per requested strategy. The seed/target
+    split, retrieval, positives, and seed profile are shared across strategies;
+    only the negatives differ (hard = retrieved non-targets, random = random
+    catalog non-members). So every strategy trains on the same playlists and the
+    same positives -- a clean single-variable comparison.
+
+    return: dict {strategy: polars df} with columns playlist_int_id, label,
+            als_score, the six track_*, and the six avg_* features.
     """
     print('Fetching track metadata catalog...')
     query_tracks = """
@@ -152,10 +233,14 @@ def fetch_training_data(als_model, user_item_matrix, conn, n_playlists=N_TRAIN_P
     for pid, tint, tid in track_rows:
         playlist_tracks[pid].append((tint, tid))
 
-    print(f'Retrieving candidates from seed tracks (recalculate_user) for {len(playlist_tracks)} playlists...')
+    want_hard = 'hard' in strategies
+    want_random = 'random' in strategies
+    print(f'Retrieving candidates from seed tracks (recalculate_user) for {len(playlist_tracks)} playlists '
+          f'[strategies: {", ".join(sorted(strategies))}]...')
     n_items = user_item_matrix.shape[1]
-    seed_pl, seed_tid = [], []                      # (playlist, seed track_id) -> seed profile
-    cand_pl, cand_tint, cand_label, cand_score = [], [], [], []
+    rng = np.random.default_rng(seed)
+    seed_pl, seed_tid = [], []                                   # (playlist, seed track_id) -> seed profile
+    acc = {s: {'pl': [], 'tint': [], 'label': [], 'als': []} for s in strategies}
     kept = 0
     for pid, tracks in playlist_tracks.items():
         if len(tracks) < 2:
@@ -165,15 +250,15 @@ def fetch_training_data(als_model, user_item_matrix, conn, n_playlists=N_TRAIN_P
             continue
         seed_tints = [t[0] for t in seed_pairs]
         target_tints = {int(t[0]) for t in target_pairs}
+        member_tints = {int(t[0]) for t in tracks}  # seed + target -- excluded from random negatives
 
-        # Build the seed user vector exactly as get_live_recommendations does, then
-        # retrieve via recalculate_user -- the identical Stage-1 path used at serving.
-        user_row = csr_matrix(
+        # Seed user vector + retrieval -- the identical Stage-1 path used at serving.
+        seed_row = csr_matrix(
             (np.ones(len(seed_tints)), (np.zeros(len(seed_tints)), np.asarray(seed_tints))),
             shape=(1, n_items),
         )
         ids, scores = als_model.recommend(
-            0, user_row, N=n_candidates, recalculate_user=True, filter_already_liked_items=True)
+            0, seed_row, N=n_candidates, recalculate_user=True, filter_already_liked_items=True)
         ids = np.asarray(ids).reshape(-1)
         scores = np.asarray(scores).reshape(-1)
         valid = ids >= 0
@@ -182,21 +267,22 @@ def fetch_training_data(als_model, user_item_matrix, conn, n_playlists=N_TRAIN_P
             continue
 
         labels = np.fromiter((1 if int(t) in target_tints else 0 for t in ids), dtype=int, count=len(ids))
-        if labels.sum() == 0:
-            continue  # no held-out target was retrieved -> no positive -> unusable group
-
-        # Keep all positives + the hardest n_neg negatives (ids come back score-desc,
-        # so the first negatives are the highest-scored = most confusable).
         pos_idx = np.where(labels == 1)[0]
-        neg_idx = np.where(labels == 0)[0][:n_neg]
-        for i in np.concatenate([pos_idx, neg_idx]):
-            cand_pl.append(pid)
-            cand_tint.append(int(ids[i]))
-            cand_label.append(int(labels[i]))
-            cand_score.append(float(scores[i]))
+        if len(pos_idx) == 0:
+            continue  # no held-out target retrieved -> no positive -> skip (for ALL strategies)
+
+        pos_tints, pos_scores = ids[pos_idx], scores[pos_idx]
         for _tint, tid in seed_pairs:
             seed_pl.append(pid)
             seed_tid.append(tid)
+
+        if want_hard:
+            neg_idx = np.where(labels == 0)[0][:n_neg]  # hardest (highest-scored) retrieved non-targets
+            _append_candidates(acc['hard'], pid, pos_tints, pos_scores, ids[neg_idx], scores[neg_idx])
+        if want_random:
+            rand_tints = _sample_random_negatives(rng, n_items, member_tints, n_neg)
+            rand_scores = _score_items_recalc(als_model, seed_row, rand_tints, pid)
+            _append_candidates(acc['random'], pid, pos_tints, pos_scores, rand_tints, rand_scores)
         kept += 1
 
     if kept == 0:
@@ -204,7 +290,7 @@ def fetch_training_data(als_model, user_item_matrix, conn, n_playlists=N_TRAIN_P
             "No usable training playlists (no held-out target was ever retrieved). "
             "Increase --n-playlists or --n-candidates."
         )
-    print(f'Kept {kept} playlists with >=1 retrieved target; {len(cand_pl)} candidate rows.')
+    print(f'Kept {kept} playlists with >=1 retrieved target.')
 
     # Seed profile (avg_*) per playlist -- over SEED tracks only (kills circularity).
     df_profiles = (
@@ -214,32 +300,20 @@ def fetch_training_data(als_model, user_item_matrix, conn, n_playlists=N_TRAIN_P
         .agg([pl.col(tf).mean().alias(af) for tf, af in zip(TRACK_FEATURES, AVG_FEATURES)])
     )
 
-    # Map candidate track_int_id -> track_id, then attach candidate metadata + profile.
+    # Map every candidate track_int_id (across strategies) -> track_id, once.
+    all_tints = np.unique(np.concatenate([np.asarray(acc[s]['tint'], dtype=np.int64) for s in strategies]))
     with conn.cursor() as cur:
         cur.execute(
             """SELECT DISTINCT track_int_id, track_id
                FROM interaction_matrix_mapped
                WHERE track_int_id = ANY(%s)""",
-            (np.unique(np.asarray(cand_tint)).tolist(),),
+            (all_tints.tolist(),),
         )
         map_rows = cur.fetchall()
     df_map = pl.DataFrame(map_rows, schema=['track_int_id', 'track_id'], orient='row').with_columns(
         pl.col('track_int_id').cast(pl.Int64))
 
-    df = (
-        pl.DataFrame({
-            'playlist_int_id': cand_pl,
-            'track_int_id': cand_tint,
-            'label': cand_label,
-            'als_score': cand_score,
-        })
-        .with_columns(pl.col('track_int_id').cast(pl.Int64), pl.col('als_score').cast(pl.Float64))
-        .join(df_map, on='track_int_id', how='inner')
-        .drop('track_int_id')
-        .join(df_metadata, on='track_id', how='inner')       # candidate track_* features
-        .join(df_profiles, on='playlist_int_id', how='inner')  # avg_* seed profile
-    )
-    return df
+    return {s: _build_strategy_df(acc[s], df_map, df_metadata, df_profiles) for s in strategies}
 
 
 def engineer_features(df):
@@ -248,33 +322,15 @@ def engineer_features(df):
     already attached from fetch_training_data (built over SEED tracks), so this
     just differences it against each candidate's track_* features.
     """
-    print('Calculating profile alignment features...')
     return df.with_columns([
-        (pl.col(af) - pl.col(tf)).abs().alias(df_col)
-        for af, tf, df_col in zip(AVG_FEATURES, TRACK_FEATURES, DIFF_FEATURES)
+        (pl.col(af) - pl.col(tf)).abs().alias(diff_col)
+        for af, tf, diff_col in zip(AVG_FEATURES, TRACK_FEATURES, DIFF_FEATURES)
     ])
 
 
-def train_ranker(n_playlists=N_TRAIN_PLAYLISTS, n_candidates=N_CANDIDATES,
-                 holdout_frac=HOLDOUT_FRAC, n_neg=N_NEG_PER_PLAYLIST, seed=SEED):
-    """
-    Trains the gradient boosting ranking model on the train-like-serve data.
-    return: trained model
-    """
-    print('Training ranking model...')
-
-    als_model, user_item_matrix = load_als()
-    conn = psycopg.connect(DB_URI)
-    try:
-        raw_df = fetch_training_data(
-            als_model, user_item_matrix, conn,
-            n_playlists=n_playlists, n_candidates=n_candidates,
-            holdout_frac=holdout_frac, n_neg=n_neg, seed=seed,
-        )
-    finally:
-        conn.close()
-
-    processed_df = engineer_features(raw_df)
+def _fit_and_save(df, out_path, strategy):
+    """Fits an XGBRanker on one strategy's feature frame and saves it."""
+    processed_df = engineer_features(df)
 
     # A ranking group needs both a positive and a negative to carry signal.
     label_counts = processed_df.group_by('playlist_int_id').agg(
@@ -291,7 +347,7 @@ def train_ranker(n_playlists=N_TRAIN_PLAYLISTS, n_candidates=N_CANDIDATES,
     y = processed_df['label'].to_numpy()
 
     n_pos = int((y == 1).sum())
-    print(f'Training XGBRanker on {len(processed_df)} candidates ({n_pos} positive) '
+    print(f'[{strategy}] Training XGBRanker on {len(processed_df)} candidates ({n_pos} positive) '
           f'across {len(group_counts)} playlists...')
     ranker = xgb.XGBRanker(
         objective='rank:ndcg',
@@ -300,19 +356,57 @@ def train_ranker(n_playlists=N_TRAIN_PLAYLISTS, n_candidates=N_CANDIDATES,
         max_depth=6,
         random_state=42
     )
-
     ranker.fit(X, y, group=group_counts)
-    print('XGBRanker training complete!')
 
-    print('Saving model...')
-    ranker.save_model(str(MODELS_DIR / 'xgb_ranker.json'))
-    print('XGBRanker model saved!')
-
+    ranker.save_model(str(out_path))
+    print(f'[{strategy}] Saved ranker to {out_path}')
     return ranker
+
+
+def train_ranker(strategies, out_paths, n_playlists=N_TRAIN_PLAYLISTS, n_candidates=N_CANDIDATES,
+                 holdout_frac=HOLDOUT_FRAC, n_neg=N_NEG_PER_PLAYLIST, seed=SEED):
+    """
+    Trains one XGBRanker per strategy in `strategies` (subset of {'hard','random'})
+    and saves each to out_paths[strategy]. The expensive retrieval loop is shared
+    across strategies.
+    """
+    print('Training ranking model(s)...')
+    als_model, user_item_matrix = load_als()
+    conn = psycopg.connect(DB_URI)
+    try:
+        dfs = fetch_training_data(
+            als_model, user_item_matrix, conn, strategies,
+            n_playlists=n_playlists, n_candidates=n_candidates,
+            holdout_frac=holdout_frac, n_neg=n_neg, seed=seed,
+        )
+    finally:
+        conn.close()
+
+    models = {}
+    for strategy in strategies:
+        models[strategy] = _fit_and_save(dfs[strategy], out_paths[strategy], strategy)
+    print('Done.')
+    return models
+
+
+def _resolve_out_paths(strategies, out):
+    """Maps each strategy to an output path. `--out` only applies to a single strategy."""
+    if len(strategies) > 1:
+        if out is not None:
+            raise SystemExit("--out cannot be used with --negatives both; each strategy gets its own file.")
+        return {s: MODELS_DIR / f'xgb_ranker_{s}.json' for s in strategies}
+    (strategy,) = tuple(strategies)
+    return {strategy: Path(out) if out is not None else MODELS_DIR / f'xgb_ranker_{strategy}.json'}
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train the Stage 2 XGBRanker (train-like-serve).')
+    parser.add_argument('--negatives', choices=['hard', 'random', 'both'], default='hard',
+                        help="Negative-sampling strategy to train. 'both' trains and saves each "
+                             "for side-by-side comparison (default: hard).")
+    parser.add_argument('--out', type=str, default=None,
+                        help="Output model path (single strategy only). Default: "
+                             "models/xgb_ranker_<strategy>.json.")
     parser.add_argument('--n-playlists', type=int, default=N_TRAIN_PLAYLISTS,
                         help=f'Playlists sampled for training (default: {N_TRAIN_PLAYLISTS}).')
     parser.add_argument('--n-candidates', type=int, default=N_CANDIDATES,
@@ -320,10 +414,13 @@ if __name__ == '__main__':
     parser.add_argument('--holdout-frac', type=float, default=HOLDOUT_FRAC,
                         help=f'Fraction of each playlist hidden as targets (default: {HOLDOUT_FRAC}).')
     parser.add_argument('--n-neg', type=int, default=N_NEG_PER_PLAYLIST,
-                        help=f'Hard negatives kept per playlist (default: {N_NEG_PER_PLAYLIST}).')
+                        help=f'Negatives kept per playlist, per strategy (default: {N_NEG_PER_PLAYLIST}).')
     parser.add_argument('--seed', type=int, default=SEED,
-                        help=f'Seed for the per-playlist seed/target split (default: {SEED}).')
+                        help=f'Seed for the seed/target split + random negatives (default: {SEED}).')
     args = parser.parse_args()
 
-    train_ranker(n_playlists=args.n_playlists, n_candidates=args.n_candidates,
+    strategies = {'hard', 'random'} if args.negatives == 'both' else {args.negatives}
+    out_paths = _resolve_out_paths(strategies, args.out)
+
+    train_ranker(strategies, out_paths, n_playlists=args.n_playlists, n_candidates=args.n_candidates,
                  holdout_frac=args.holdout_frac, n_neg=args.n_neg, seed=args.seed)

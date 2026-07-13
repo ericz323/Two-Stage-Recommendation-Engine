@@ -293,12 +293,55 @@ def _summarize_debiased(results):
         print(f"Full Engine vs Popularity (long-tail) -- NDCG@K:  t={t_stat:.3f}, p={p_val:.4f}")
 
 
-def load_models():
+def debug_rerank(playlists, als_model, user_item_matrix, xgb_model, k=20,
+                 holdout_frac=0.2, seed=None, conn=None, n_debug=3):
+    """
+    For the first `n_debug` playlists, prints what the reranker actually does:
+    the xgb-score distribution (to catch degenerate/constant predictions), and the
+    engine's top-k vs ALS-only's top-k with their held-out hit counts. This tells
+    "sane-but-unlucky reranking" apart from "the model is broken."
+    """
+    print(f"\n=== DEBUG: reranker inspection (first {n_debug} playlists) ===")
+    for idx, (pid, track_ids) in enumerate(playlists.items()):
+        if idx >= n_debug:
+            break
+        seed_tracks, held_out = split_holdout(track_ids, holdout_frac, seed=stable_seed(pid, seed))
+        held_set = set(held_out)
+
+        candidate_integers, als_scores = get_als_candidates(seed_tracks, als_model, user_item_matrix, n=200, conn=conn)
+        df_full = rank_candidates(seed_tracks, candidate_integers, als_scores, xgb_model, k=k, conn=conn, return_full=True)
+        eng_recs = df_full['track_id'].to_list()[:k]
+        als_recs = get_als_only_recommendations(
+            seed_tracks, als_model, user_item_matrix, k=k, candidate_integers=candidate_integers, conn=conn)
+
+        xgb_scores = df_full['xgb_score'].to_numpy()
+        als_feat = df_full['als_score'].to_numpy()
+        eng_hits = [t for t in eng_recs if t in held_set]
+        als_hits = [t for t in als_recs if t in held_set]
+        survived = [t for t in als_hits if t in set(eng_recs)]
+
+        print(f"\nPlaylist {pid}: {len(held_out)} held-out, {len(candidate_integers)} retrieved, {df_full.height} scored")
+        print(f"  xgb_score : min={xgb_scores.min():.4f} max={xgb_scores.max():.4f} "
+              f"std={xgb_scores.std():.6f} distinct={np.unique(xgb_scores).size}/{xgb_scores.size}")
+        if np.unique(xgb_scores).size == 1:
+            print("  [WARN] all xgb predictions are IDENTICAL -> reranking is degenerate "
+                  "(final order is arbitrary, not learned).")
+        print(f"  als_score feature: min={als_feat.min():.4f} max={als_feat.max():.4f} "
+              f"std={als_feat.std():.6f}")
+        print(f"  hits in top-{k}:  ALS-only={len(als_hits)}   Engine={len(eng_hits)}   "
+              f"(ALS-only hits kept by engine: {len(survived)}/{len(als_hits)})")
+        print(f"  ALS-only top5 track_ids: {als_recs[:5]}")
+        print(f"  Engine   top5 track_ids: {eng_recs[:5]}")
+
+
+def load_models(ranker_path=None):
     print('Loading models into memory...')
+    ranker_path = ranker_path or (MODELS_DIR / 'xgb_ranker_hard.json')
+    print(f'  (ranker: {ranker_path})')
     als_model = AlternatingLeastSquares().load(str(MODELS_DIR / 'als_model.npz'))
     user_item_matrix = load_npz(str(MODELS_DIR / 'user_item_matrix.npz'))
     xgb_model = xgb.XGBRanker()
-    xgb_model.load_model(str(MODELS_DIR / 'xgb_ranker.json'))
+    xgb_model.load_model(str(ranker_path))
     return als_model, user_item_matrix, xgb_model
 
 
@@ -315,9 +358,15 @@ def main():
                          help="Size of the global 'popular head' for the popularity-debiased eval. "
                               "Held-out tracks outside the top-N most-interacted tracks are treated "
                               "as long-tail, where the popularity baseline can't score (default: 10000).")
+    parser.add_argument("--ranker-path", type=str, default=None,
+                         help="Path to the XGBRanker model to evaluate (default: models/xgb_ranker.json). "
+                              "Point at e.g. models/xgb_ranker_hard.json vs _random.json to compare rankers.")
+    parser.add_argument("--debug-n", type=int, default=0,
+                         help="If >0, print reranker diagnostics (xgb-score distribution, engine vs "
+                              "ALS-only top-k) for the first N playlists before the full eval.")
     args = parser.parse_args()
 
-    als_model, user_item_matrix, xgb_model = load_models()
+    als_model, user_item_matrix, xgb_model = load_models(ranker_path=args.ranker_path)
 
     # prepare_threshold=None: this connection is shared across the whole run, so the
     # same query text runs thousands of times on it. psycopg3 would auto-prepare
@@ -333,6 +382,10 @@ def main():
     popularity_baseline = fetch_global_popularity(conn, top_n=args.k)
     print(f"Fetching popular head ({args.n_popular} tracks) for debiased eval...")
     popular_set = fetch_popular_track_set(conn, args.n_popular)
+
+    if args.debug_n:
+        debug_rerank(playlists, als_model, user_item_matrix, xgb_model,
+                     k=args.k, holdout_frac=args.holdout_frac, seed=args.seed, conn=conn, n_debug=args.debug_n)
 
     print("Evaluating recommendations...")
     results = evaluate_pipeline(
