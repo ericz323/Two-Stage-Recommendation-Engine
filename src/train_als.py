@@ -1,7 +1,32 @@
+"""
+train_als.py
+Trains the Stage 1 retriever: an implicit-feedback ALS matrix factorization over
+the playlist-track interaction matrix.
+
+Reads `interaction_matrix_mapped` (the contiguous 0-based integer ids created by
+src/ingestion.py) and compresses it into a sparse playlist x track CSR matrix.
+Every observed playlist-track pair gets confidence 1.0; unobserved pairs stay
+zero, which is what "implicit feedback" means here -- absence is treated as weak
+negative signal, not as a known dislike.
+
+Saves two files:
+  - models/als_model.npz        -- the learned playlist/track factors
+  - models/user_item_matrix.npz -- the interaction matrix itself, needed to
+                                   recalculate a user factor for cold-start seeds
+
+Run:
+    python src/train_als.py
+"""
+
 import polars as pl
 import numpy as np
 from scipy.sparse import csr_matrix, save_npz
 from implicit.als import AlternatingLeastSquares
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MODELS_DIR = PROJECT_ROOT / 'models'
+MODELS_DIR.mkdir(exist_ok=True)
 
 def build_csr_matrix():
     """
@@ -30,6 +55,7 @@ def build_csr_matrix():
 
     return sparse_user_item_matrix
 
+
 def train_als_model(user_item_matrix):
     """
     Trains an Alternating Least Squares factorization model with a given user-item matrix.
@@ -43,8 +69,8 @@ def train_als_model(user_item_matrix):
     print('Training complete!')
 
     print('Saving model...')
-    model.save('als_model.npz')
-    save_npz('user_item_matrix.npz', user_item_matrix)
+    model.save(str(MODELS_DIR / 'als_model.npz'))
+    save_npz(str(MODELS_DIR / 'user_item_matrix.npz'), user_item_matrix)
     print('ALS model saved!')
 
     # # Test retrieval

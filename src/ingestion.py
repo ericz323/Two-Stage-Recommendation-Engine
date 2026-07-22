@@ -1,3 +1,29 @@
+"""
+ingestion.py
+Builds the PostgreSQL foundation the whole engine reads from.
+
+Three stages, in order:
+  1. process_metadata()        -- skims every MPD slice for unique track_ids and
+                                  left-joins the acoustic features from the
+                                  Kaggle SQLite archive -> `track_metadata`.
+                                  This is the shift-left ETL: features are merged
+                                  in once here, so inference never calls an
+                                  audio-features API.
+  2. process_interactions()    -- streams (playlist_id, track_id) pairs from the
+                                  MPD one slice at a time (to cap memory) into
+                                  `interaction_matrix`.
+  3. create_integer_mappings() -- adds `interaction_matrix_mapped`, which
+                                  DENSE_RANKs playlist_id/track_id into the
+                                  contiguous 0-based integers ALS requires, and
+                                  indexes both. The aggregation runs inside
+                                  Postgres to keep Python's footprint small.
+
+NOTE: JSON_FOLDER and the SQLite URI are relative paths  -- run this from `src/`
+
+Run:
+    python ingestion.py
+"""
+
 import polars as pl
 import json
 import glob
