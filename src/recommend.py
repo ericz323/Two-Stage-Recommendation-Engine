@@ -1,3 +1,36 @@
+"""
+recommend.py
+The inference path: turns a playlist (or a handful of seed tracks) into a ranked
+Top-K, running the full two-stage funnel. Training and serving are decoupled --
+this script only loads the artifacts the training scripts wrote, so a request
+never pays for retraining.
+
+The two stages, and the seams between them:
+  - Stage 1 retrieval  -- get_als_candidates() narrows the catalog to ~200
+                          plausible candidates using the trained ALS model.
+  - Stage 2 reranking  -- rank_candidates() builds features (via
+                          src/feature_engineering.generate_features) and reorders
+                          that pool with the XGBRanker.
+generate_recommendations() chains both. They're split apart so a caller that
+needs the raw Stage-1 output too (e.g. the eval scripts' ALS-only ablation arm)
+can reuse one retrieval instead of running Stage 1 twice for the same target.
+
+`target` is either an existing playlist_int_id (int) or a list of seed track_ids
+(the cold-start path, which recalculates a user factor on the fly). Both stages
+accept either form.
+
+Ranking ties are broken by als_score: XGBRanker frequently assigns candidates
+identical scores, and without a tie-break the sort falls back to relevance-blind
+DB order, which can make the full engine score WORSE than ALS-only.
+
+Loads models/als_model.npz, models/user_item_matrix.npz, and
+models/xgb_ranker.json -- run src/train_als.py and src/train_ranking.py first.
+
+Run:
+    python src/recommend.py --playlist-id 42
+    python src/recommend.py --track-ids <track_id> <track_id> ... -k 20
+"""
+
 import argparse
 import polars as pl
 import numpy as np
@@ -22,11 +55,17 @@ def _connection(conn):
     if conn is not None:
         yield conn
     else:
-        with psycopg.connect(DB_URI) as local_conn:
+        # prepare_threshold=None: never auto-prepare, so `col = ANY($1)` queries are
+        # always planned with the actual array values (custom plan) and use the
+        # indexes, rather than risking a generic-plan seq scan. (A per-call
+        # connection here rarely repeats a query enough to prepare anyway, but a
+        # caller may pass in a long-lived shared conn -- see the eval scripts.)
+        with psycopg.connect(DB_URI, prepare_threshold=None) as local_conn:
             yield local_conn
 
 
 def get_live_recommendations(track_ids, als_model, user_item_matrix, num_recs=20, conn=None):
+    """Cold start: gets candidates from the ALS model from a list of track IDs, not a playlist index from the database."""
     track_int_query = """
         SELECT track_int_id
         FROM interaction_matrix_mapped
@@ -59,6 +98,7 @@ def get_als_candidates(target, als_model, user_item_matrix, n=200, conn=None):
 
     return: (candidate_integers, als_scores), already ranked by ALS score descending
     """
+    print('[1/2] Creating candidates...')
     if isinstance(target, int):
         candidate_integers, als_scores = als_model.recommend(
             userid=target,
@@ -109,15 +149,23 @@ def get_als_only_recommendations(target, als_model, user_item_matrix, k=20, cand
     return map_track_ints_to_ids(candidate_integers[:k], conn=conn)
 
 
-def rank_candidates(target, candidate_integers, xgb_model, k=20, conn=None):
+def rank_candidates(target, candidate_integers, als_scores, xgb_model, k=20, conn=None, return_full=False):
     """
     Stage 2 (XGBRanker reranking) only: feature engineering + scoring for an
     already-retrieved candidate pool. Split out of generate_recommendations so
     callers that also need the raw Stage-1 candidates (e.g. an ALS-only arm
     scored alongside the full engine) can reuse the same retrieval instead of
     running Stage 1 twice for the same target.
+
+    param als_scores: the Stage-1 ALS scores for candidate_integers (aligned),
+        passed through as the `als_score` ranking feature so the reranker keeps
+        the collaborative signal instead of reordering on acoustics alone.
+    param return_full: if True, return the FULL scored candidate frame (sorted,
+        with the `xgb_score` column) instead of just the top-k -- for debugging the
+        reranker's score distribution.
     """
-    df_features = generate_features(target, candidate_integers, conn=conn)
+    print('[2/2] Ranking candidates...')
+    df_features = generate_features(target, candidate_integers, als_scores, conn=conn)
 
     feature_columns = [
         'track_danceability',
@@ -131,14 +179,22 @@ def rank_candidates(target, candidate_integers, xgb_model, k=20, conn=None):
         'energy_diff',
         'acousticness_diff',
         'loudness_diff',
-        'valence_diff'
+        'valence_diff',
+        'als_score'
     ]
     X_inf = df_features[feature_columns].to_pandas()
 
     xgb_scores = xgb_model.predict(X_inf)
 
-    df_ranked = df_features.with_columns(pl.Series('xgb_score', xgb_scores))
-    return df_ranked.sort('xgb_score', descending=True).head(k)
+    # Tie-break by als_score: XGBRanker often gives many candidates identical scores
+    # (same leaves). Without a tie-break the stable sort falls back to DB row order,
+    # which is relevance-blind and can scramble ALS's good ordering -- making the
+    # engine do WORSE than ALS-only. Breaking ties by als_score means flat/tied
+    # regions fall back to ALS (retrieval) order, so reranking can't underperform
+    # ALS-only just from arbitrary tie-breaking.
+    df_ranked = df_features.with_columns(pl.Series('xgb_score', xgb_scores)).sort(
+        ['xgb_score', 'als_score'], descending=True)
+    return df_ranked if return_full else df_ranked.head(k)
 
 
 def generate_recommendations(target, als_model, user_item_matrix, xgb_model, k=20, conn=None):
@@ -155,11 +211,9 @@ def generate_recommendations(target, als_model, user_item_matrix, xgb_model, k=2
     print('Generating recommendations...')
 
     # 1. Retrieval
-    print('[1/2] Creating candidates...')
     candidate_integers, als_scores = get_als_candidates(target, als_model, user_item_matrix, n=200, conn=conn)
 
-    print('[2/2] Ranking candidates...')
-    return rank_candidates(target, candidate_integers, xgb_model, k=k, conn=conn)
+    return rank_candidates(target, candidate_integers, als_scores, xgb_model, k=k, conn=conn)
 
 
 def report(top_20, conn=None):

@@ -1,24 +1,22 @@
-# Two-Stage "Discover Weekly" Playlist Engine
+# Two-Stage Music Recommendation Engine
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-316192?style=for-the-badge&logo=postgresql&logoColor=white)
 ![Polars](https://img.shields.io/badge/Polars-000000?style=for-the-badge&logo=polars&logoColor=white)
 ![XGBoost](https://img.shields.io/badge/XGBoost-15C39A?style=for-the-badge&logo=xgboost&logoColor=white)
 ![SciPy](https://img.shields.io/badge/SciPy-8CAAE6?style=for-the-badge&logo=scipy&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
 
-This project simulates how Spotify might build "Discover Weekly" end-to-end: give it a playlist, and it hands back
-twenty tracks the listener probably hasn't heard yet but would likely enjoy. It's trained on the Spotify Million
+This project simulates how Spotify might build a "Discover Weekly" playlist end-to-end: give it a playlist, and it hands back
+twenty tracks the listener probably hasn't heard yet but would likely enjoy. Trained on the Spotify Million
 Playlist Dataset, roughly 66 million listening interactions across 2 million tracks.
 
-Rather than pushing that much data through a single monolithic model (or a Pandas DataFrame that would fall over
-trying), the project splits the problem into a **Two-Stage Funnel**: a fast retrieval pass that narrows millions
+Rather than pushing that much data through a single monolithic model, the project splits the problem into a **Two-Stage Funnel**: a fast retrieval pass that narrows millions
 of candidates down to a couple hundred, followed by a more expensive ranking pass that sorts those down to the
 final twenty. **PostgreSQL** handles the heavy, out-of-core data transformations, **Polars** does the vectorized
 feature engineering, and **XGBoost (Learning-to-Rank)** handles the final sort.
 
 ## Dataset Overview
 
-The pipeline is built to handle real production-scale data rather than a toy sample, so it orchestrates over two
-sizeable tables from the start:
+The pipeline orchestrates over two sizeable tables from the start:
 
 ### 1. Interaction Matrix (`interaction_matrix`)
 From the Spotify Million Playlist Dataset. Each row is an implicit co-occurrence signal — a track that showed up
@@ -113,8 +111,7 @@ inference path never has to pay the cost of retraining.
 
 ## Evaluation
 
-Evaluation lives in its own [`eval/`](eval/) directory, separate from the `src/` pipeline code it measures — these
-scripts import from `src` but aren't part of the serving path themselves. Both use a held-out split of each
+Evaluation lives in its own [`eval/`](eval/) directory. Both use a held-out split of each
 playlist's tracks as a proxy for "would the listener have liked this recommendation":
 
 * **[`eval/evaluate.py`](eval/evaluate.py)** runs an offline comparison of three systems — the full engine (ALS +
@@ -127,15 +124,20 @@ gets right. Reports Recall@K and NDCG@K for each arm, with a paired t-test again
   python eval/evaluate.py --n-playlists 2000 --holdout-frac 0.2 --k 20
   ```
 
-* **[`eval/ab_test_sim.py`](eval/ab_test_sim.py)** simulates a proper A/B/C test across the same three arms. It runs
-a small pilot sample first to estimate baseline rates and variance, prints a power analysis (minimum detectable
-effect at the requested sample size, and the sample size actually required to hit a target lift) before touching
-the full data, and then reports results using the paired tests that fit a design where every playlist is scored
-under all three arms: McNemar's test for the binary hit-rate metric, paired t-tests for the continuous ones, plus
-a paired bootstrap CI on each as a cross-check.
+* **[`eval/ab_test_sim.py`](eval/ab_test_sim.py)** is the live-experiment counterpart to `evaluate.py`, focused on
+the one question a re-ranker A/B test should answer: does the full engine (ALS + XGBRanker) actually beat ALS-only
+retrieval? Where `evaluate.py` scores every playlist under every arm and uses paired tests (a within-subjects
+offline comparison), this script simulates what a real A/B test can actually do: it assigns each playlist to
+**exactly one** of the two arms — a between-subjects, one-arm-per-playlist split — and compares them with
+independent-sample tests (Welch's t-test for the continuous metrics, a two-proportion z-test for the binary hit
+rate). It runs a small pilot first (scored under both arms) to estimate each arm's rate and variance, prints a
+power analysis (minimum detectable effect at the planned sample size, and the per-arm sample size actually required
+to hit a target lift) before touching the full data, and sizes the full run to ~2× the required per-arm n. A side
+benefit of the one-arm-per-playlist design: only ~1/2 of playlists run the expensive full-engine pipeline, so it's
+cheaper than scoring both arms on every playlist.
 
   ```bash
-  python eval/ab_test_sim.py --n-playlists 2000 --k 20 --pilot-n 200
+  python eval/ab_test_sim.py --n-playlists 3000 --k 20 --pilot-n 200
   ```
 
 ## Running the Pipeline
@@ -175,8 +177,10 @@ python src/train_ranking.py
 Generate a playlist. This mocks a request for a given user, loads the trained artifacts into memory, runs them
 through the full retrieval-then-ranking funnel, and prints the resulting Top 20 tracks:
 
+Pass either an existing playlist (`--playlist-id`) or a set of seed tracks (`--track-ids`, the cold-start path):
+
 ```bash
-python src/recommend.py
+python src/recommend.py --playlist-id 42
 ```
 
 ### 6. Evaluate the Engine
@@ -186,6 +190,6 @@ Once you have trained models, check whether they're actually earning their compl
 
 ```bash
 python eval/evaluate.py --n-playlists 2000 --holdout-frac 0.2 --k 20
-python eval/ab_test_sim.py --n-playlists 2000 --k 20 --pilot-n 200
+python eval/ab_test_sim.py --n-playlists 3000 --k 20 --pilot-n 200
 ```
 

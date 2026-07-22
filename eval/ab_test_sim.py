@@ -1,60 +1,49 @@
 """
 ab_test_sim.py
-Simulates an A/B/C test comparing three arms, using held-out tracks as a
+Simulates a live A/B test comparing two arms, using held-out tracks as a
 proxy for engagement:
   - Treatment:   Full engine   (ALS retrieval + XGBRanker reranking)
-  - Als_only:    ALS-only      (ALS retrieval, no reranking -- ablation arm)
-  - Control:     Popularity    (most-interacted-with tracks globally)
+  - Als_only:    ALS-only      (ALS retrieval, no reranking -- the baseline arm)
+
+This is the LIVE-EXPERIMENT counterpart to evaluate.py, focused on the one
+question a re-ranker A/B test should answer: does the full engine beat raw ALS
+retrieval? evaluate.py scores every playlist under every arm and uses PAIRED
+tests -- a within-subjects offline comparison that squeezes maximum power out of
+a fixed set of playlists. A real live A/B test can't do that: it must randomize
+each user/playlist to EXACTLY ONE arm (between-subjects) and compare arms with
+independent-sample tests. This script simulates that design:
+
+  - Each playlist is assigned to exactly one arm (a 2-way random split), so no
+    playlist is ever scored under more than one arm.
+  - Comparisons use independent-sample tests: Welch's t-test for the
+    continuous metrics (NDCG@K, Recall@K), a two-proportion z-test for the
+    binary hit-rate metric.
+  - The bootstrap CI resamples each arm's group independently (not shared
+    indices), matching the unpaired design.
 
 A pilot sample (PILOT_N playlists, drawn independently of the full sample) is
-run through all three arms (same pipeline as the full simulation) to
-estimate the paired statistics the power analysis actually needs: the std of
-per-playlist differences for continuous metrics, and the discordant-pair
-rate for the binary metric (McNemar's test). These are estimated separately
-for Treatment-vs-Control and Treatment-vs-ALS-only, since the two
-comparisons can have very different variance/discordance.
-
-The number of playlists for the full simulation is then derived from the
-power analysis itself (the largest required-n across all metrics and
-comparisons), rather than being guessed upfront -- mirroring how a real
-experiment's sample size is set. Pass --n-playlists to override this with a
-fixed value; if it's below what the power analysis requires, the run
-proceeds anyway but is flagged as underpowered.
+scored under BOTH arms -- the pilot is small, so scoring every arm on every
+pilot playlist is cheap and gives the most precise per-arm mean/variance
+estimates the power analysis needs. From those, the required PER-ARM sample
+size is derived (the largest across all metrics), and the full simulation is
+sized to ~2x that in total (one arm per playlist, so two arms need 2x the
+per-arm n). Pass --n-playlists to override the TOTAL sample size; if it implies
+fewer than the required per-arm n, the run proceeds but is flagged as
+underpowered.
 
 METRICS:
   Primary:    NDCG@K   -- matches the XGBRanker training objective directly
   Secondary:  Recall@K -- fraction of held-out tracks recovered (continuous)
   Tertiary:   Hit rate -- binary, did at least one held-out track appear
 
-Each metric is analyzed as follows:
-  - A parametric paired test (McNemar's test for binary, paired t-test for continuous)
-  - A paired bootstrap CI (resamples playlist indices, not each arm's column
-    independently, so the pairing is preserved in every replicate)
-  - Agreement check between the two (flags if they diverge)
-
-NOTE: This is a simulation, not a live experiment. No real users are randomized.
-The held-out split is a proxy for engagement. MDE and power calculations use
-the same formulas a real experiment would, and (as of the pilot-driven sizing
-above) the sample size decision is made the same way too: from the pilot,
-before the full simulation runs.
-
-PAIRED vs UNPAIRED: the primary analysis above is PAIRED -- every playlist is
-scored under all three arms against the same held-out split. That's only
-possible offline; a real live A/B test must assign each user/playlist to
-exactly ONE arm (between-subjects) and compare with independent-sample tests
-(Welch's t-test, a two-proportion z-test), not paired ones. Pairing removes
-playlist-to-playlist variance from the error term, so for the same true
-effect the paired design here is more powerful -- smaller p-values, tighter
-CIs, a smaller required-n -- than a live test measuring the identical effect
-would be. To make that gap concrete, this script also prints the unpaired
-required-n alongside the paired one in the power analysis, and re-splits the
-same simulated playlists into three disjoint groups (see `report_unpaired`)
-to show what a real, between-subjects live A/B test would actually require
-and show.
+NOTE: This is a simulation, not a live experiment. No real users are
+randomized; the held-out split is a proxy for engagement. But the design and
+statistics mirror a real between-subjects A/B test: pilot-driven sample
+sizing, one-arm-per-playlist assignment, and independent-sample tests.
 
 Run:
     python eval/ab_test_sim.py --k 20 --pilot-n 100
-    python eval/ab_test_sim.py --n-playlists 2000  # override auto-sizing
+    python eval/ab_test_sim.py --n-playlists 3000  # override auto-sizing (total across arms)
 """
 
 import argparse
@@ -66,7 +55,6 @@ from scipy import stats
 from eval.evaluate import (
     DB_URI,
     fetch_playlists,
-    fetch_global_popularity,
     split_holdout,
     stable_seed,
     recall_at_k,
@@ -74,8 +62,13 @@ from eval.evaluate import (
     get_engine_and_als_recommendations,
     load_models,
 )
+from src.recommend import get_als_candidates, rank_candidates, get_als_only_recommendations
 
-PILOT_N = 100  # playlists used to estimate baseline before full simulation
+PILOT_N = 200  # playlists used to estimate per-arm stats before the full simulation
+
+# index % 2 -> arm, for the one-arm-per-playlist assignment in the full simulation.
+# The fetch is already seed-shuffled, so this is an effectively-random 2-way split.
+ARMS = ("treatment", "als")
 
 
 # Metric helpers
@@ -85,54 +78,12 @@ def binary_hit(recommended, held_out, k):
 
 
 # Statistical tests
-def mcnemar_test(treatment_binary, control_binary):
-    """
-    McNemar's test for paired binary outcomes -- the correct test here since
-    every playlist is scored under both arms with the same held-out split.
-    Only discordant pairs (where the arms disagree) carry information;
-    concordant pairs (both hit or both miss) cancel out and are ignored.
-
-    Returns: b (treatment-only hits), c (control-only hits), chi2 stat, p-value
-    """
-    treatment_binary = np.asarray(treatment_binary)
-    control_binary = np.asarray(control_binary)
-    b = int(np.sum((treatment_binary == 1) & (control_binary == 0)))
-    c = int(np.sum((treatment_binary == 0) & (control_binary == 1)))
-    if b + c == 0:
-        return b, c, 0.0, 1.0
-    chi2_stat = (abs(b - c) - 1) ** 2 / (b + c)  # continuity-corrected
-    p_val = stats.chi2.sf(chi2_stat, df=1)
-    return b, c, chi2_stat, p_val
-
-
-def bootstrap_ci(treatment, control, n_boot=5000, ci=95, seed=42):
-    """
-    Paired bootstrap CI for the difference in means (treatment - control).
-    Resamples playlist INDICES (not each arm's column independently) so the
-    pairing -- same playlist, same held-out split, under both arms -- is
-    preserved in every replicate. Works for binary or continuous metrics.
-    """
-    rng = np.random.default_rng(seed)
-    treatment = np.asarray(treatment, dtype=float)
-    control = np.asarray(control, dtype=float)
-    n = len(treatment)
-    diffs = np.empty(n_boot)
-
-    for i in range(n_boot):
-        idx = rng.integers(0, n, size=n)
-        diffs[i] = (treatment[idx] - control[idx]).mean()
-
-    lower = np.percentile(diffs, (100 - ci) / 2)
-    upper = np.percentile(diffs, 100 - (100 - ci) / 2)
-    return diffs.mean(), lower, upper
-
-
 def two_proportion_ztest(binary_a, binary_b):
     """
     Pooled-variance two-proportion z-test for INDEPENDENT binary samples --
-    the test a real live A/B test's hit-rate comparison would use, since it
-    assigns each user/playlist to exactly one arm rather than scoring every
-    playlist under every arm (the analogue to `mcnemar_test`, for unpaired data).
+    the test a real live A/B test's hit-rate comparison uses, since it assigns
+    each user/playlist to exactly one arm rather than scoring every playlist
+    under every arm.
 
     Returns: p_a, p_b, z stat, p-value
     """
@@ -151,9 +102,8 @@ def two_proportion_ztest(binary_a, binary_b):
 
 def bootstrap_ci_unpaired(a, b, n_boot=5000, ci=95, seed=42):
     """
-    Independent-groups bootstrap CI for the difference in means. Resamples
-    each group SEPARATELY (not shared indices, since the groups aren't
-    paired here) -- the analogue to `bootstrap_ci`, for unpaired data.
+    Independent-groups bootstrap CI for the difference in means. Resamples each
+    group SEPARATELY (not shared indices, since the groups aren't paired here).
     """
     rng = np.random.default_rng(seed)
     a = np.asarray(a, dtype=float)
@@ -182,54 +132,12 @@ def check_agreement(parametric_excludes_zero, boot_lo, boot_hi, label):
         print(f"  [WARN] Parametric test and bootstrap DISAGREE ({label}) -- inspect data distribution")
 
 
-# Power analysis
-def mde_binary_paired(n, discordant_rate, power=0.8, alpha=0.05):
-    """
-    Minimum detectable effect for a paired binary metric (McNemar's test).
-    Power depends on the discordant-pair rate psi = P(arms disagree on a
-    given playlist) -- NOT the marginal hit rate, which is what an
-    (incorrect, for this design) independent two-proportion test would use.
-    Assumes the target MDE is small relative to psi (standard approximation).
-    """
-    z_alpha = stats.norm.ppf(1 - alpha / 2)
-    z_beta = stats.norm.ppf(power)
-    return (z_alpha + z_beta) * np.sqrt(discordant_rate / n)
-
-
-def mde_continuous_paired(n, std_diff, power=0.8, alpha=0.05):
-    """
-    Minimum detectable effect for a paired continuous metric (paired t-test).
-    Uses the std of per-playlist differences (treatment - comparison), which
-    captures the correlation between arms that pairing is meant to exploit --
-    NOT sqrt(2)*std of a single arm, which is the independent two-sample formula.
-    """
-    z_alpha = stats.norm.ppf(1 - alpha / 2)
-    z_beta = stats.norm.ppf(power)
-    return (z_alpha + z_beta) * std_diff / np.sqrt(n)
-
-
-def required_n_binary_paired(discordant_rate, target_mde, power=0.8, alpha=0.05):
-    """Inverse of mde_binary_paired."""
-    z_alpha = stats.norm.ppf(1 - alpha / 2)
-    z_beta = stats.norm.ppf(power)
-    n = ((z_alpha + z_beta) ** 2 * discordant_rate) / target_mde ** 2
-    return int(np.ceil(n))
-
-
-def required_n_continuous_paired(std_diff, target_mde, power=0.8, alpha=0.05):
-    """Inverse of mde_continuous_paired."""
-    z_alpha = stats.norm.ppf(1 - alpha / 2)
-    z_beta = stats.norm.ppf(power)
-    n = ((z_alpha + z_beta) * std_diff / target_mde) ** 2
-    return int(np.ceil(n))
-
-
+# Power analysis (independent-groups / unpaired)
 def mde_binary_unpaired(n, p_a, p_b, power=0.8, alpha=0.05):
     """
     Minimum detectable effect for two INDEPENDENT proportions (two-proportion
-    z-test), each with the same per-arm sample size n -- what a real live A/B
-    test's hit-rate comparison needs, since it can't reuse the same playlist
-    across arms the way this simulation's paired design does.
+    z-test), each with per-arm sample size n -- what a real live A/B test's
+    hit-rate comparison needs, since it can't reuse a playlist across arms.
     """
     z_alpha = stats.norm.ppf(1 - alpha / 2)
     z_beta = stats.norm.ppf(power)
@@ -238,7 +146,7 @@ def mde_binary_unpaired(n, p_a, p_b, power=0.8, alpha=0.05):
 
 
 def required_n_binary_unpaired(p_a, p_b, target_mde, power=0.8, alpha=0.05):
-    """Inverse of mde_binary_unpaired."""
+    """Inverse of mde_binary_unpaired. Returns required PER-ARM sample size."""
     z_alpha = stats.norm.ppf(1 - alpha / 2)
     z_beta = stats.norm.ppf(power)
     p_bar = (p_a + p_b) / 2
@@ -249,9 +157,9 @@ def required_n_binary_unpaired(p_a, p_b, target_mde, power=0.8, alpha=0.05):
 def mde_continuous_unpaired(n, std_a, std_b, power=0.8, alpha=0.05):
     """
     Minimum detectable effect for two INDEPENDENT continuous samples (Welch's
-    t-test), each with the same per-arm sample size n. Uses each arm's own
-    std (NOT the std of per-playlist differences, which relies on the
-    pairing this design doesn't have) -- what a real live A/B test needs.
+    t-test), each with per-arm sample size n. Uses each arm's own std (NOT the
+    std of per-playlist differences, which relies on pairing this design
+    doesn't have) -- what a real live A/B test needs.
     """
     z_alpha = stats.norm.ppf(1 - alpha / 2)
     z_beta = stats.norm.ppf(power)
@@ -259,7 +167,7 @@ def mde_continuous_unpaired(n, std_a, std_b, power=0.8, alpha=0.05):
 
 
 def required_n_continuous_unpaired(std_a, std_b, target_mde, power=0.8, alpha=0.05):
-    """Inverse of mde_continuous_unpaired."""
+    """Inverse of mde_continuous_unpaired. Returns required PER-ARM sample size."""
     z_alpha = stats.norm.ppf(1 - alpha / 2)
     z_beta = stats.norm.ppf(power)
     n = ((z_alpha + z_beta) ** 2 * (std_a ** 2 + std_b ** 2)) / target_mde ** 2
@@ -268,53 +176,31 @@ def required_n_continuous_unpaired(std_a, std_b, target_mde, power=0.8, alpha=0.
 
 def compute_pilot_stats(pilot_results):
     """
-    Computes the paired statistics the power analysis needs from a pilot run
-    (a `run_simulation`-shaped results dict): the discordant-pair rate for
-    the binary metric, and the std of per-playlist differences for the
-    continuous metrics. Computed separately for Treatment-vs-Control and
-    Treatment-vs-ALS-only, since the two comparisons can differ a lot --
-    e.g. Treatment vs Control (a weak baseline) tends to be highly
-    discordant/high-variance, while Treatment vs ALS-only (a related model)
-    tends to be more correlated.
+    From a pilot scored under both arms, computes the per-arm statistics the
+    unpaired power analysis needs: each arm's hit rate (for the binary
+    two-proportion test) and each arm's mean/std of Recall@K and NDCG@K (for
+    the Welch continuous tests). These are marginal per-arm quantities -- the
+    unpaired design can't exploit any playlist-level pairing -- so a single
+    arm's mean/std over the pilot is exactly what a live test would work from.
     """
     t_bin = np.asarray(pilot_results["treatment_binary"])
     a_bin = np.asarray(pilot_results["als_binary"])
-    c_bin = np.asarray(pilot_results["control_binary"])
     t_recall = np.asarray(pilot_results["treatment_recall"])
     a_recall = np.asarray(pilot_results["als_recall"])
-    c_recall = np.asarray(pilot_results["control_recall"])
     t_ndcg = np.asarray(pilot_results["treatment_ndcg"])
     a_ndcg = np.asarray(pilot_results["als_ndcg"])
-    c_ndcg = np.asarray(pilot_results["control_ndcg"])
 
     return {
-        "binary_discordant_rate": {
-            "vs_control": np.mean(t_bin != c_bin),
-            "vs_als": np.mean(t_bin != a_bin),
-        },
-        "recall_diff_std": {
-            "vs_control": np.std(t_recall - c_recall, ddof=1),
-            "vs_als": np.std(t_recall - a_recall, ddof=1),
-        },
-        "ndcg_diff_std": {
-            "vs_control": np.std(t_ndcg - c_ndcg, ddof=1),
-            "vs_als": np.std(t_ndcg - a_ndcg, ddof=1),
-        },
-        # Per-arm (not paired-diff) stats -- feed the unpaired/independent-groups
-        # power formulas, which don't get to exploit the pairing correlation.
         "hit_rate": {
             "treatment": np.mean(t_bin),
-            "control": np.mean(c_bin),
             "als": np.mean(a_bin),
         },
         "recall_arm_stats": {
             "treatment": (np.mean(t_recall), np.std(t_recall, ddof=1)),
-            "control": (np.mean(c_recall), np.std(c_recall, ddof=1)),
             "als": (np.mean(a_recall), np.std(a_recall, ddof=1)),
         },
         "ndcg_arm_stats": {
             "treatment": (np.mean(t_ndcg), np.std(t_ndcg, ddof=1)),
-            "control": (np.mean(c_ndcg), np.std(c_ndcg, ddof=1)),
             "als": (np.mean(a_ndcg), np.std(a_ndcg, ddof=1)),
         },
     }
@@ -322,317 +208,215 @@ def compute_pilot_stats(pilot_results):
 
 def compute_required_n(pilot_stats, target_mde_hit_rate, target_mde_recall, target_mde_ndcg):
     """
-    Computes the sample size required to hit ~80% power for each metric's
-    target MDE, for each comparison (vs Control, vs ALS-only), using the
-    paired-design pilot stats. Returns the per-metric-per-comparison
-    requirements plus the overall requirement (the max across all of them --
-    the binding constraint, since the full simulation must be large enough
-    to power every reported comparison at once).
-
-    Also computes the UNPAIRED equivalent (binary_unpaired/recall_unpaired/
-    ndcg_unpaired/overall_unpaired) from the same pilot's per-arm stats: the
-    sample size a real live, between-subjects A/B test would need to detect
-    the same target effect, since it can't exploit the playlist-level
-    pairing this simulation's design relies on.
+    Per-ARM sample size required for ~80% power at each metric's target MDE, for
+    the Treatment vs ALS-only comparison, using the independent-groups formulas
+    -- what a real live A/B test needs, since it can't reuse a playlist across
+    arms. Returns the per-metric requirements plus 'overall' (the max across all
+    of them -- the binding per-arm constraint, since every reported comparison
+    must be powered at once).
     """
-    required = {
-        "binary": {}, "recall": {}, "ndcg": {},
-        "binary_unpaired": {}, "recall_unpaired": {}, "ndcg_unpaired": {},
-    }
-    for comparison, other_arm in (("vs_control", "control"), ("vs_als", "als")):
-        required["binary"][comparison] = required_n_binary_paired(
-            pilot_stats["binary_discordant_rate"][comparison], target_mde_hit_rate)
-        required["recall"][comparison] = required_n_continuous_paired(
-            pilot_stats["recall_diff_std"][comparison], target_mde_recall)
-        required["ndcg"][comparison] = required_n_continuous_paired(
-            pilot_stats["ndcg_diff_std"][comparison], target_mde_ndcg)
+    required = {}
+    required["binary"] = required_n_binary_unpaired(
+        pilot_stats["hit_rate"]["treatment"], pilot_stats["hit_rate"]["als"], target_mde_hit_rate)
+    _, t_recall_std = pilot_stats["recall_arm_stats"]["treatment"]
+    _, a_recall_std = pilot_stats["recall_arm_stats"]["als"]
+    required["recall"] = required_n_continuous_unpaired(
+        t_recall_std, a_recall_std, target_mde_recall)
+    _, t_ndcg_std = pilot_stats["ndcg_arm_stats"]["treatment"]
+    _, a_ndcg_std = pilot_stats["ndcg_arm_stats"]["als"]
+    required["ndcg"] = required_n_continuous_unpaired(
+        t_ndcg_std, a_ndcg_std, target_mde_ndcg)
 
-        required["binary_unpaired"][comparison] = required_n_binary_unpaired(
-            pilot_stats["hit_rate"]["treatment"], pilot_stats["hit_rate"][other_arm], target_mde_hit_rate)
-        _, t_recall_std = pilot_stats["recall_arm_stats"]["treatment"]
-        _, other_recall_std = pilot_stats["recall_arm_stats"][other_arm]
-        required["recall_unpaired"][comparison] = required_n_continuous_unpaired(
-            t_recall_std, other_recall_std, target_mde_recall)
-        _, t_ndcg_std = pilot_stats["ndcg_arm_stats"]["treatment"]
-        _, other_ndcg_std = pilot_stats["ndcg_arm_stats"][other_arm]
-        required["ndcg_unpaired"][comparison] = required_n_continuous_unpaired(
-            t_ndcg_std, other_ndcg_std, target_mde_ndcg)
-
-    required["overall"] = max(
-        v for metric in ("binary", "recall", "ndcg") for v in required[metric].values()
-    )
-    required["overall_unpaired"] = max(
-        v for metric in ("binary_unpaired", "recall_unpaired", "ndcg_unpaired") for v in required[metric].values()
-    )
+    required["overall"] = max(required["binary"], required["recall"], required["ndcg"])
     return required
 
 
-def print_power_analysis(pilot_stats, required_n, n_playlists, target_mde_hit_rate, target_mde_recall, target_mde_ndcg):
+def print_power_analysis(pilot_stats, required_n, per_arm_n, target_mde_hit_rate, target_mde_recall, target_mde_ndcg):
     """
-    Prints MDE for each metric/comparison given the full simulation sample
-    size, plus the sample size required to detect the target effect size --
-    so the "how many playlists do we need" decision is explicit rather than
-    reverse-engineered from whatever n_playlists happened to be passed in.
-
-    Alongside each paired requirement (this simulation's design), also prints
-    the UNPAIRED requirement: how many playlists per arm a real live,
-    between-subjects A/B test would need for the same target effect, since it
-    can't reuse a playlist across arms the way this simulation's paired
-    design does. The paired requirement is always <= the unpaired one for the
-    same effect size -- that gap is the "power bonus" pairing gets you here,
-    which a live experiment won't have.
+    Prints, for each metric, the MDE achievable at the planned per-arm sample
+    size and the per-arm sample size required to hit the target MDE at ~80%
+    power. All figures are PER ARM (independent groups); the full simulation
+    fetches ~2x this in total, one arm per playlist.
     """
-    print("\n=== Pre-Experiment Power Analysis ===")
-    print(f"Full simulation sample size: {n_playlists} playlists per arm (paired design)")
-    print(f"(Estimates from independent pilot of {PILOT_N} playlists)\n")
+    print("\n=== Pre-Experiment Power Analysis (between-subjects / unpaired) ===")
+    print(f"Planned per-arm sample size: {per_arm_n} playlists  (~{2 * per_arm_n} total across 2 arms)")
+    print(f"(Estimates from independent pilot of {PILOT_N} playlists, scored under both arms)\n")
 
-    comparisons = (("vs_control", "vs Control"), ("vs_als", "vs ALS-only"))
+    def _report(label, mde_fn, stat_args, target_mde, req_n, unit_desc):
+        print(f"{label}:")
+        mde_at_n = mde_fn(per_arm_n, *stat_args)
+        print(f"  vs ALS-only -- MDE at per-arm n={per_arm_n}: {mde_at_n:.4f}")
+        print(f"    Target effect size: {target_mde:.4f} {unit_desc} -- requires per-arm n >= {req_n}")
+        if per_arm_n >= req_n:
+            print(f"    [OK] per-arm n={per_arm_n} meets or exceeds the required sample size ({req_n}).")
+        else:
+            print(f"    [WARN] per-arm n={per_arm_n} is BELOW the required sample size ({req_n}) "
+                  f"to detect a {target_mde:.4f} lift with ~80% power.")
 
-    def _report_paired(label, mde_fn, stat_key, target_mde, req_n_by_comparison, unit_desc):
-        print(f"{label} [paired -- this simulation's design]:")
-        for key, comp_label in comparisons:
-            stat_val = pilot_stats[stat_key][key]
-            mde_at_n = mde_fn(n_playlists, stat_val)
-            req_n = req_n_by_comparison[key]
-            print(f"  {comp_label} -- MDE at n={n_playlists}: {mde_at_n:.4f}")
-            print(f"    Target effect size: {target_mde:.4f} {unit_desc} -- requires n >= {req_n} playlists/arm")
-            if n_playlists >= req_n:
-                print(f"    [OK] n={n_playlists} meets or exceeds the required sample size ({req_n}).")
-            else:
-                print(f"    [WARN] n={n_playlists} is BELOW the required sample size ({req_n}) "
-                      f"to detect a {target_mde:.4f} lift with ~80% power.")
-
-    def _report_unpaired(label, req_n_by_comparison):
-        print(f"{label} [unpaired -- what a real live A/B test needs]:")
-        for key, comp_label in comparisons:
-            print(f"  {comp_label} -- requires n >= {req_n_by_comparison[key]} playlists/arm (independent groups)")
-
-    _report_paired("Binary hit rate", mde_binary_paired, "binary_discordant_rate",
-                   target_mde_hit_rate, required_n["binary"], "absolute lift")
-    _report_unpaired("Binary hit rate", required_n["binary_unpaired"])
+    _report("Binary hit rate", mde_binary_unpaired,
+            (pilot_stats["hit_rate"]["treatment"], pilot_stats["hit_rate"]["als"]),
+            target_mde_hit_rate, required_n["binary"], "absolute lift")
     print()
-    _report_paired("Continuous recall", mde_continuous_paired, "recall_diff_std",
-                   target_mde_recall, required_n["recall"], "mean difference")
-    _report_unpaired("Continuous recall", required_n["recall_unpaired"])
+    _report("Continuous recall", mde_continuous_unpaired,
+            (pilot_stats["recall_arm_stats"]["treatment"][1], pilot_stats["recall_arm_stats"]["als"][1]),
+            target_mde_recall, required_n["recall"], "mean difference")
     print()
-    _report_paired("NDCG@K", mde_continuous_paired, "ndcg_diff_std",
-                   target_mde_ndcg, required_n["ndcg"], "mean NDCG difference")
-    _report_unpaired("NDCG@K", required_n["ndcg_unpaired"])
+    _report("NDCG@K", mde_continuous_unpaired,
+            (pilot_stats["ndcg_arm_stats"]["treatment"][1], pilot_stats["ndcg_arm_stats"]["als"][1]),
+            target_mde_ndcg, required_n["ndcg"], "mean NDCG difference")
 
-    print(f"\nOverall required n, paired (this simulation's design): {required_n['overall']} playlists/arm")
-    print(f"Overall required n, unpaired (a real live/randomized test): {required_n['overall_unpaired']} playlists/arm")
-    if n_playlists == required_n["overall"]:
-        print("Full simulation sample size was set from the paired power analysis above.\n")
+    overall = required_n["overall"]
+    print(f"\nOverall required per-arm n (max across metrics): {overall}")
+    if per_arm_n == overall:
+        print(f"Full simulation sized from this: ~{2 * overall} playlists total (one arm per playlist).\n")
     else:
-        print(f"NOTE: --n-playlists override was used ({n_playlists}) instead of the "
-              f"paired-power-analysis-derived value ({required_n['overall']}).\n")
+        print(f"NOTE: --n-playlists override in effect (per-arm ~{per_arm_n}, ~{2 * per_arm_n} total) "
+              f"instead of the power-analysis value (per-arm {overall}, ~{2 * overall} total).\n")
 
 
 # Simulation
-def run_simulation(playlists, als_model, user_item_matrix, xgb_model, popularity_baseline, k=20, holdout_frac=0.2, seed=None, conn=None):
+def run_pilot(playlists, als_model, user_item_matrix, xgb_model, k=20, holdout_frac=0.2, seed=None, conn=None):
     """
-    Runs all three arms over the full playlist sample. Each playlist sees the
-    engine (treatment), ALS-only (ablation arm), and popularity baseline
-    (control) against the same held-out split.
+    Scores every pilot playlist under BOTH arms (treatment, ALS-only) against
+    the same held-out split, to estimate per-arm stats for the power analysis.
+    The pilot is small, so running every arm on every playlist is cheap and
+    maximizes the precision of each arm's mean/variance estimate. Unlike the
+    full simulation, this is NOT one-arm-per-playlist.
     """
-    treatment_binary, als_binary, control_binary = [], [], []
-    treatment_recall, als_recall, control_recall = [], [], []
-    treatment_ndcg, als_ndcg, control_ndcg = [], [], []
+    treatment_binary, als_binary = [], []
+    treatment_recall, als_recall = [], []
+    treatment_ndcg, als_ndcg = [], []
 
     for index, (pid, track_ids) in enumerate(playlists.items()):
-        print(f"Simulating playlist {index + 1} of {len(playlists)}")
+        print(f"Pilot playlist {index + 1} of {len(playlists)}")
         seed_tracks, held_out = split_holdout(track_ids, holdout_frac, seed=stable_seed(pid, seed))
 
         recs_treatment, recs_als = get_engine_and_als_recommendations(
             seed_tracks, als_model, user_item_matrix, xgb_model, k=k, conn=conn)
-        recs_control = popularity_baseline
 
         treatment_binary.append(binary_hit(recs_treatment, held_out, k))
         als_binary.append(binary_hit(recs_als, held_out, k))
-        control_binary.append(binary_hit(recs_control, held_out, k))
 
         treatment_recall.append(recall_at_k(recs_treatment, held_out, k))
         als_recall.append(recall_at_k(recs_als, held_out, k))
-        control_recall.append(recall_at_k(recs_control, held_out, k))
 
         treatment_ndcg.append(ndcg_at_k(recs_treatment, held_out, k))
         als_ndcg.append(ndcg_at_k(recs_als, held_out, k))
-        control_ndcg.append(ndcg_at_k(recs_control, held_out, k))
 
     return {
-        "treatment_binary": treatment_binary, "als_binary": als_binary, "control_binary": control_binary,
-        "treatment_recall": treatment_recall, "als_recall": als_recall, "control_recall": control_recall,
-        "treatment_ndcg": treatment_ndcg, "als_ndcg": als_ndcg, "control_ndcg": control_ndcg,
+        "treatment_binary": treatment_binary, "als_binary": als_binary,
+        "treatment_recall": treatment_recall, "als_recall": als_recall,
+        "treatment_ndcg": treatment_ndcg, "als_ndcg": als_ndcg,
     }
 
 
+def run_simulation(playlists, als_model, user_item_matrix, xgb_model, k=20, holdout_frac=0.2, seed=None, conn=None):
+    """
+    Full between-subjects simulation: each playlist is assigned to EXACTLY ONE
+    arm (index % 2 via ARMS -- the fetch is already seed-shuffled, so this is an
+    effectively-random 2-way split) and scored only under that arm. Returns
+    per-arm metric lists over DISJOINT playlist groups (~n/2 each), the way a
+    real live A/B test collects data.
+
+    Only the treatment arm runs the full engine (retrieval + rerank); ALS-only
+    runs retrieval alone -- so roughly half of the expensive full-engine work is
+    avoided vs. scoring every playlist under both arms.
+    """
+    results = {
+        "treatment_binary": [], "als_binary": [],
+        "treatment_recall": [], "als_recall": [],
+        "treatment_ndcg": [], "als_ndcg": [],
+    }
+
+    for index, (pid, track_ids) in enumerate(playlists.items()):
+        arm = ARMS[index % 2]
+        print(f"Simulating playlist {index + 1} of {len(playlists)} [{arm}]")
+        seed_tracks, held_out = split_holdout(track_ids, holdout_frac, seed=stable_seed(pid, seed))
+
+        if arm == "treatment":
+            candidate_integers, als_scores = get_als_candidates(seed_tracks, als_model, user_item_matrix, n=200, conn=conn)
+            recs = rank_candidates(seed_tracks, candidate_integers, als_scores, xgb_model, k=k, conn=conn)["track_id"].to_list()
+        else:  # als
+            recs = get_als_only_recommendations(seed_tracks, als_model, user_item_matrix, k=k, conn=conn)
+
+        results[f"{arm}_binary"].append(binary_hit(recs, held_out, k))
+        results[f"{arm}_recall"].append(recall_at_k(recs, held_out, k))
+        results[f"{arm}_ndcg"].append(ndcg_at_k(recs, held_out, k))
+
+    return results
+
+
 # Reporting
-def _report_metric(label, k_desc, treatment, arm_b, control, test_fn, test_label_a, test_label_b):
-    """Reports Treatment vs Control and Treatment vs ALS-only for one metric."""
-    print(f"\n{label} {k_desc}:")
+def _report_metric_unpaired(label, treatment, arm_b, arm_b_name):
+    """Reports Treatment vs `arm_b_name` for one continuous metric as INDEPENDENT
+    groups (Welch's t-test)."""
+    print(f"\n{label} (independent groups):")
 
-    t_stat, p_val = test_fn(treatment, control)
-    print(f"  Treatment: {np.mean(treatment):.4f}   Control: {np.mean(control):.4f}   "
-          f"Lift: {np.mean(treatment) - np.mean(control):+.4f}")
-    print(f"  {test_label_a}: t = {t_stat:.3f}, p = {p_val:.4f}")
-    mean_diff, lo, hi = bootstrap_ci(treatment, control)
-    print(f"  Bootstrap 95% CI vs Control: [{lo:.4f}, {hi:.4f}]  (mean diff: {mean_diff:.4f})")
-    check_agreement(p_val < 0.05, lo, hi, f"{label} vs Control")
-
-    t_stat_als, p_val_als = test_fn(treatment, arm_b)
-    print(f"  ALS-only:  {np.mean(arm_b):.4f}   Lift over ALS-only: {np.mean(treatment) - np.mean(arm_b):+.4f}")
-    print(f"  {test_label_b}: t = {t_stat_als:.3f}, p = {p_val_als:.4f}")
-    mean_diff_als, lo_als, hi_als = bootstrap_ci(treatment, arm_b)
-    print(f"  Bootstrap 95% CI vs ALS-only: [{lo_als:.4f}, {hi_als:.4f}]  (mean diff: {mean_diff_als:.4f})")
-    check_agreement(p_val_als < 0.05, lo_als, hi_als, f"{label} vs ALS-only")
-
-
-def _report_binary_vs(treatment_binary, other_binary, other_name):
-    """Reports Treatment vs `other_name` for the binary hit-rate metric via McNemar's test."""
-    p_t = np.mean(treatment_binary)
-    p_o = np.mean(other_binary)
-    b, c, chi2_stat, p_val = mcnemar_test(treatment_binary, other_binary)
-    print(f"  {other_name}: {p_o:.4f}   Lift over {other_name}: {p_t - p_o:+.4f}")
-    print(f"  McNemar's test vs {other_name}: b={b} (treatment-only hits), c={c} ({other_name}-only hits), "
-          f"chi2 = {chi2_stat:.3f}, p = {p_val:.4f}")
-    mean_diff, lo, hi = bootstrap_ci(treatment_binary, other_binary)
-    print(f"  Bootstrap 95% CI vs {other_name}: [{lo:.4f}, {hi:.4f}]  (mean diff: {mean_diff:.4f})")
-    check_agreement(p_val < 0.05, lo, hi, f"Hit rate vs {other_name}")
-
-
-def _report_metric_unpaired(label, treatment, arm_b, control, arm_b_name):
-    """Reports Treatment vs Control and Treatment vs `arm_b_name` for one continuous
-    metric as INDEPENDENT groups (Welch's t-test) -- the unpaired analogue to
-    `_report_metric`."""
-    print(f"\n{label} (unpaired, independent groups):")
-
-    t_stat, p_val = stats.ttest_ind(treatment, control, equal_var=False)
+    t_stat, p_val = stats.ttest_ind(treatment, arm_b, equal_var=False)
     print(f"  Treatment: {np.mean(treatment):.4f} (n={len(treatment)})   "
-          f"Control: {np.mean(control):.4f} (n={len(control)})   "
-          f"Lift: {np.mean(treatment) - np.mean(control):+.4f}")
-    print(f"  Welch's t-test: t = {t_stat:.3f}, p = {p_val:.4f}")
-    mean_diff, lo, hi = bootstrap_ci_unpaired(treatment, control)
-    print(f"  Bootstrap 95% CI vs Control: [{lo:.4f}, {hi:.4f}]  (mean diff: {mean_diff:.4f})")
-    check_agreement(p_val < 0.05, lo, hi, f"{label} vs Control (unpaired)")
-
-    t_stat_b, p_val_b = stats.ttest_ind(treatment, arm_b, equal_var=False)
-    print(f"  {arm_b_name}: {np.mean(arm_b):.4f} (n={len(arm_b)})   "
+          f"{arm_b_name}: {np.mean(arm_b):.4f} (n={len(arm_b)})   "
           f"Lift over {arm_b_name}: {np.mean(treatment) - np.mean(arm_b):+.4f}")
-    print(f"  Welch's t-test: t = {t_stat_b:.3f}, p = {p_val_b:.4f}")
-    mean_diff_b, lo_b, hi_b = bootstrap_ci_unpaired(treatment, arm_b)
-    print(f"  Bootstrap 95% CI vs {arm_b_name}: [{lo_b:.4f}, {hi_b:.4f}]  (mean diff: {mean_diff_b:.4f})")
-    check_agreement(p_val_b < 0.05, lo_b, hi_b, f"{label} vs {arm_b_name} (unpaired)")
+    print(f"  Welch's t-test: t = {t_stat:.3f}, p = {p_val:.4f}")
+    mean_diff, lo, hi = bootstrap_ci_unpaired(treatment, arm_b)
+    print(f"  Bootstrap 95% CI vs {arm_b_name}: [{lo:.4f}, {hi:.4f}]  (mean diff: {mean_diff:.4f})")
+    check_agreement(p_val < 0.05, lo, hi, f"{label} vs {arm_b_name}")
 
 
 def _report_binary_vs_unpaired(treatment_binary, other_binary, other_name):
     """Reports Treatment vs `other_name` for the binary hit-rate metric as
-    INDEPENDENT groups via `two_proportion_ztest` -- the unpaired analogue to
-    `_report_binary_vs`."""
+    INDEPENDENT groups via `two_proportion_ztest`."""
     p_t, p_o, z_stat, p_val = two_proportion_ztest(treatment_binary, other_binary)
     print(f"  {other_name}: {p_o:.4f} (n={len(other_binary)})   Lift over {other_name}: {p_t - p_o:+.4f}")
     print(f"  Two-proportion z-test vs {other_name}: z = {z_stat:.3f}, p = {p_val:.4f}")
     mean_diff, lo, hi = bootstrap_ci_unpaired(treatment_binary, other_binary)
     print(f"  Bootstrap 95% CI vs {other_name}: [{lo:.4f}, {hi:.4f}]  (mean diff: {mean_diff:.4f})")
-    check_agreement(p_val < 0.05, lo, hi, f"Hit rate vs {other_name} (unpaired)")
+    check_agreement(p_val < 0.05, lo, hi, f"Hit rate vs {other_name}")
 
 
-def report_unpaired(results, k, required_n_unpaired=None):
+def report(results, k, required_per_arm_n=None):
     """
-    Re-analyzes the SAME simulation results as an independent-groups
-    (unpaired) comparison -- what a real live, between-subjects A/B test
-    would actually show, since it must assign each playlist to exactly one
-    arm rather than scoring every playlist under all three the way the
-    paired `report()` above does.
-
-    Doesn't re-run the simulation: splits the same n playlists into three
-    disjoint groups by index % 3 (the sample order is already randomized via
-    the seeded SQL fetch, so this is an effectively-random 3-way split) and
-    keeps only ONE arm's value per playlist -- group 0's treatment values,
-    group 1's control values, group 2's als-only values. No playlist
-    contributes to more than one arm's group here, mirroring the constraint
-    a live test faces, at zero extra DB/model cost. Each arm's group is
-    therefore ~n/3 rather than the full n.
+    Reports the between-subjects results. Each arm's lists come from a DISJOINT
+    group of playlists (assigned in run_simulation), so all comparisons use
+    independent-sample tests -- the way a real live A/B test is analyzed.
     """
-    n = len(results["treatment_ndcg"])
-    group = np.arange(n) % 3
-    treat_idx, control_idx, als_idx = group == 0, group == 1, group == 2
+    t_ndcg, a_ndcg = results["treatment_ndcg"], results["als_ndcg"]
+    t_recall, a_recall = results["treatment_recall"], results["als_recall"]
+    t_bin, a_bin = results["treatment_binary"], results["als_binary"]
 
-    def _split(key, idx):
-        return np.asarray(results[key])[idx]
-
-    print("\n=== Unpaired (Independent-Groups) Equivalent: what a real live A/B test would show ===\n")
-    print("A real live experiment can't show the same playlist two arms, so it must split playlists")
-    print("into disjoint groups -- one arm per group -- and compare with independent-sample tests,")
-    print("not the paired tests above. This re-splits the same playlists into three disjoint groups")
-    print(f"({int(treat_idx.sum())}/{int(control_idx.sum())}/{int(als_idx.sum())} playlists) so no")
-    print("playlist is scored under more than one arm, then re-analyzes with Welch's t-test / a")
-    print("two-proportion z-test.")
-
-    print(f"\n[PRIMARY] NDCG@{k}:")
-    _report_metric_unpaired(
-        "NDCG",
-        _split("treatment_ndcg", treat_idx), _split("als_ndcg", als_idx), _split("control_ndcg", control_idx),
-        "ALS-only",
-    )
-
-    print(f"\n[SECONDARY] Recall@{k}:")
-    _report_metric_unpaired(
-        "Recall",
-        _split("treatment_recall", treat_idx), _split("als_recall", als_idx), _split("control_recall", control_idx),
-        "ALS-only",
-    )
-
-    print(f"\n[TERTIARY] Binary hit rate (>=1 relevant track in Top {k}):")
-    t_bin = _split("treatment_binary", treat_idx)
-    print(f"  Treatment: {np.mean(t_bin):.4f} (n={len(t_bin)})")
-    _report_binary_vs_unpaired(t_bin, _split("control_binary", control_idx), "Control")
-    _report_binary_vs_unpaired(t_bin, _split("als_binary", als_idx), "ALS-only")
-
-    if required_n_unpaired is not None:
-        group_n = int(treat_idx.sum())
-        print(f"\nEach arm's group here has ~{group_n} playlists; the pre-experiment unpaired power "
-              f"analysis said a live test needs >= {required_n_unpaired} per arm for the target MDE.")
-        if group_n < required_n_unpaired:
-            print("[WARN] This unpaired split is underpowered relative to that requirement.")
-
-
-def report(results, n_playlists, k):
-    print("\n=== A/B/C Test Simulation Results: Full Engine vs ALS-only vs Popularity ===\n")
-    print("(All comparisons are paired -- the same playlists are scored under every arm --")
-    print(" so paired tests (t-test, McNemar's) are used rather than independent-sample tests.)")
+    print("\n=== A/B Test Simulation Results: Full Engine vs ALS-only ===\n")
+    print("(Between-subjects: each playlist was assigned to exactly one arm -- disjoint groups,")
+    print(" the way a real live A/B test randomizes users -- so independent-sample tests are used")
+    print(" rather than the paired tests in evaluate.py.)")
+    print(f"\nGroup sizes -- Treatment: {len(t_ndcg)}   ALS-only: {len(a_ndcg)}")
 
     print(f"\n[PRIMARY] NDCG@{k} (matches XGBRanker training objective):")
-    _report_metric(
-        "NDCG", "",
-        results["treatment_ndcg"], results["als_ndcg"], results["control_ndcg"],
-        stats.ttest_rel, "paired t-test", "paired t-test",
-    )
+    _report_metric_unpaired("NDCG", t_ndcg, a_ndcg, "ALS-only")
 
     print(f"\n[SECONDARY] Recall@{k} (fraction of held-out tracks recovered):")
-    _report_metric(
-        "Recall", "",
-        results["treatment_recall"], results["als_recall"], results["control_recall"],
-        stats.ttest_rel, "paired t-test", "paired t-test",
-    )
+    _report_metric_unpaired("Recall", t_recall, a_recall, "ALS-only")
 
     print(f"\n[TERTIARY] Binary hit rate (>=1 relevant track in Top {k}):")
-    t_bin, a_bin, c_bin = results["treatment_binary"], results["als_binary"], results["control_binary"]
-    print(f"  Treatment: {np.mean(t_bin):.4f}")
-    _report_binary_vs(t_bin, c_bin, "Control")
-    _report_binary_vs(t_bin, a_bin, "ALS-only")
+    print(f"  Treatment: {np.mean(t_bin):.4f} (n={len(t_bin)})")
+    _report_binary_vs_unpaired(t_bin, a_bin, "ALS-only")
 
-    print(f"\nN playlists simulated: {n_playlists}")
+    if required_per_arm_n is not None:
+        smallest = min(len(t_ndcg), len(a_ndcg))
+        print(f"\nSmallest arm group: {smallest} playlists; the power analysis required per-arm "
+              f"n >= {required_per_arm_n} for the target MDE.")
+        if smallest < required_per_arm_n:
+            print("[WARN] At least one arm is underpowered relative to that requirement.")
 
 
 # Entry point
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-playlists", type=int, default=None,
-                         help="Override the full simulation's sample size instead of deriving it "
-                              "from the pilot's power analysis. If below the computed requirement, "
-                              "the run proceeds but is flagged as underpowered.")
+                         help="Override the TOTAL sample size across both arms (each arm gets ~1/2), "
+                              "instead of deriving it from the pilot's power analysis. If it implies "
+                              "fewer than the required per-arm n, the run proceeds but is flagged as "
+                              "underpowered.")
     parser.add_argument("--k", type=int, default=20)
-    parser.add_argument("--holdout-frac", type=float, default=0.2)
+    parser.add_argument("--holdout-frac", type=float, default=0.3)
     parser.add_argument("--pilot-n", type=int, default=PILOT_N)
     parser.add_argument("--target-mde-hit-rate", type=float, default=0.03,
                          help="Minimum absolute lift in hit rate worth detecting (default: 0.03 = 3pp)")
@@ -648,45 +432,52 @@ if __name__ == "__main__":
 
     als_model, user_item_matrix, xgb_model = load_models()
 
-    conn = psycopg.connect(DB_URI)
-
-    popularity_baseline = fetch_global_popularity(conn, top_n=args.k)
+    # prepare_threshold=None: this connection is shared across the whole run, so the
+    # same query text runs thousands of times on it. psycopg3 would auto-prepare
+    # each after 5 executions, after which PostgreSQL can switch to a GENERIC plan
+    # for `col = ANY($1)` that can't see the array contents, misestimates
+    # selectivity, and seq-scans despite the indexes. Disabling preparation keeps
+    # every execute planned with the actual values (custom plan) -> uses the index.
+    # autocommit is fine for a read-only connection but is NOT the perf fix.
+    conn = psycopg.connect(DB_URI, autocommit=True, prepare_threshold=None)
 
     # Step 1: pilot (drawn independently of the full sample, not a subset of it --
-    # a real experiment wouldn't reuse pilot traffic in the final analysis). Runs
-    # all three arms through the same pipeline as the full simulation, since the
-    # paired power analysis needs per-playlist differences/discordance, not just
-    # a single arm's marginal rate.
-    print(f"Running pilot on {args.pilot_n} playlists to estimate paired statistics...")
+    # a real experiment wouldn't reuse pilot traffic in the final analysis). Scored
+    # under both arms, since the power analysis needs each arm's marginal
+    # mean/variance and the pilot is small enough to afford it.
+    print(f"Running pilot on {args.pilot_n} playlists (both arms) to estimate per-arm statistics...")
     pilot_playlists = fetch_playlists(conn, args.pilot_n, seed=args.seed)
-    pilot_results = run_simulation(
+    pilot_results = run_pilot(
         pilot_playlists, als_model, user_item_matrix, xgb_model,
-        popularity_baseline, k=args.k, holdout_frac=args.holdout_frac, seed=args.seed, conn=conn,
+        k=args.k, holdout_frac=args.holdout_frac, seed=args.seed, conn=conn,
     )
     pilot_stats = compute_pilot_stats(pilot_results)
 
-    # Step 2: power analysis -- the full sample size is derived from this,
-    # not guessed upfront, unless --n-playlists explicitly overrides it.
+    # Step 2: power analysis -- gives the required PER-ARM n; the full sample
+    # (one arm per playlist) needs ~2x that in total.
     required_n = compute_required_n(
         pilot_stats, args.target_mde_hit_rate, args.target_mde_recall, args.target_mde_ndcg,
     )
-    n_playlists = args.n_playlists if args.n_playlists is not None else required_n["overall"]
+    if args.n_playlists is not None:
+        total_n = args.n_playlists
+        per_arm_n = total_n // 2
+    else:
+        per_arm_n = required_n["overall"]
+        total_n = 2 * per_arm_n
     print_power_analysis(
-        pilot_stats, required_n, n_playlists,
+        pilot_stats, required_n, per_arm_n,
         args.target_mde_hit_rate, args.target_mde_recall, args.target_mde_ndcg,
     )
 
-    # Step 3: full simulation, sized by the power analysis above
-    print("=== Running Full Simulation ===\n")
-    all_playlists = fetch_playlists(conn, n_playlists, seed=args.seed + 1)
+    # Step 3: full simulation, one arm per playlist, sized by the power analysis above
+    print("=== Running Full Simulation (one arm per playlist) ===\n")
+    all_playlists = fetch_playlists(conn, total_n, seed=args.seed + 1)
     results = run_simulation(
         all_playlists, als_model, user_item_matrix, xgb_model,
-        popularity_baseline, k=args.k, holdout_frac=args.holdout_frac, seed=args.seed + 1, conn=conn,
+        k=args.k, holdout_frac=args.holdout_frac, seed=args.seed + 1, conn=conn,
     )
 
-    # Step 4: results -- paired (this simulation's design), then the unpaired
-    # equivalent (what a real live A/B test would show/need)
-    report(results, len(all_playlists), args.k)
-    report_unpaired(results, args.k, required_n_unpaired=required_n["overall_unpaired"])
+    # Step 4: results
+    report(results, args.k, required_per_arm_n=required_n["overall"])
 
     conn.close()
