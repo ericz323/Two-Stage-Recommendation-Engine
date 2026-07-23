@@ -60,10 +60,7 @@ def generate_features(target, candidate_track_int_ids, als_scores, conn=None):
 
     candidate_ids = [int(i) for i in candidate_track_int_ids]
 
-    # Item-only features: candidate metadata. Dedup the int->id mapping FIRST (<=200
-    # rows via idx_track_int), THEN join track_metadata -- otherwise a popular
-    # candidate (present in thousands of interaction rows) would explode the join
-    # before dedup. track_int_id is carried through so als_score can be joined on it.
+    # Item-only features: candidate metadata
     item_query = """
         SELECT
             map.track_int_id,
@@ -136,9 +133,7 @@ def generate_features(target, candidate_track_int_ids, als_scores, conn=None):
     df_items = pl.DataFrame(item_rows, schema=item_columns, orient='row')
     df_user = pl.DataFrame(user_rows, schema=user_columns, orient='row')
 
-    # Attach the ALS retrieval score to each candidate BY track_int_id (never
-    # positionally -- df_items comes back in DB order and drops metadata-less
-    # candidates, so positional alignment would be wrong).
+    # Attach the ALS retrieval score to each candidate BY track_int_id
     df_scores = pl.DataFrame({
         'track_int_id': [int(i) for i in candidate_track_int_ids],
         'als_score': [float(s) for s in als_scores],
