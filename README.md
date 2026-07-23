@@ -5,18 +5,17 @@
 ![SciPy](https://img.shields.io/badge/SciPy-8CAAE6?style=for-the-badge&logo=scipy&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
 
-This project simulates how Spotify might build a "Discover Weekly" playlist end-to-end: give it a playlist, and it hands back
-twenty tracks the listener probably hasn't heard yet but would likely enjoy. Trained on the Spotify Million
-Playlist Dataset, roughly 66 million listening interactions across 2 million tracks.
+Simulates how Spotify might build a "Discover Weekly" playlist end-to-end: given a playlist, it hands back
+twenty recommended tracks the user might enjoy. Trained on the Spotify Million Playlist Dataset, roughly 66 million listening interactions across 2 million tracks.
 
-Rather than pushing that much data through a single monolithic model, the project splits the problem into a **Two-Stage Funnel**: a fast retrieval pass that narrows millions
-of candidates down to a couple hundred, followed by a more expensive ranking pass that sorts those down to the
+Rather using a single model, this project splits the problem into a **Two-Stage Funnel**: a fast retrieval pass that narrows millions
+of candidates down to a couple hundred, followed by a ranking pass that sorts those down to the
 final twenty. **PostgreSQL** handles the heavy, out-of-core data transformations, **Polars** does the vectorized
 feature engineering, and **XGBoost (Learning-to-Rank)** handles the final sort.
 
 ## Dataset Overview
 
-The pipeline orchestrates over two sizeable tables from the start:
+The pipeline works over two large tables from the start:
 
 ### 1. Interaction Matrix (`interaction_matrix`)
 From the Spotify Million Playlist Dataset. Each row is an implicit co-occurrence signal — a track that showed up
