@@ -122,6 +122,31 @@ power analysis (per-arm sample size required to reach the desired minimum detect
   python eval/ab_test_sim.py --n-playlists 3000 --k 20 --pilot-n 200
   ```
 
+## Results
+
+### Offline Evaluation
+
+| Metric      | Full Engine | ALS-only | Popularity |
+|:------------|:-----------:|:--------:|:----------:|
+| Recall@K    | `0.0164`   | `0.0184`| `0.0107`  |
+| NDCG@K      | `0.0146`   | `0.0148`| `0.0123`  |
+
+* **Full Engine vs Popularity:** `18.70`% lift in NDCG over the popularity baseline
+  (t=`1.763`, p=`0.0780`).
+* **Full Engine vs ALS-only:** `-1.35`% lift in NDCG over the ALS-only ablation
+  (t=`-0.108`, p=`0.9143`). This result is not statistically significant at `alpha`=0.05, so we cannot say that the full engine performs differently from the ALS-only ablation.
+
+### A/B Test Simulation
+
+| Metric        | Treatment | ALS-only | Lift        | Test                          |
+|:--------------|:---------:|:--------:|:-----------:|:-------------------------------|
+| NDCG@K        | `0.0124` | `0.0165`| `-0.0040`   | Welch's t: t=`-2.943`, p=`0.0033` |
+| Recall@K      | `0.0138` | `0.0196`| `-0.0059`   | Welch's t: t=`-3.576`, p=`0.0004` |
+| Hit rate      | `0.1449` | `0.1479`| `-0.0029`   | z-test: z=`-0.287`, p=`0.7738`    |
+
+The full engine underperforms compared to the ALS-only ablation, meaning it does not earn its extra complexity. In a business scenario, I would not recommend pushing the new recommendation engine.
+  
+
 ## Running the Pipeline
 
 ### 1. Download the Datasets
@@ -135,7 +160,7 @@ Make sure you have a PostgreSQL server running locally (port 5432), then install
 pip install polars psycopg connectorx implicit xgboost scipy numpy
 ```
 
-### 3. Build the Database Foundation
+### 3. Build the Database
 
 Run the ingestion script. It drops any old tables, rebuilds `track_metadata` and `interaction_matrix` from the
 raw files, and generates the integer ID mappings the sparse math needs:
